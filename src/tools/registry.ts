@@ -1,0 +1,80 @@
+import { StructuredToolInterface } from '@langchain/core/tools';
+import { levelResponseTool, marketContextTool, recentSessionsTool } from './market/index.js';
+
+export interface RegisteredTool {
+  name: string;
+  tool: StructuredToolInterface;
+  description: string;
+}
+
+const MARKET_CONTEXT_DESCRIPTION = `Measured BTC/USD session state on Hyperliquid.
+
+## When to Use
+
+- The user asks what the auction is doing right now
+- The user wants session state, VWAP, cumulative delta, aggression split, or live asset context
+- The user wants a bounded interpretive read grounded in measured evidence
+
+## When NOT to Use
+
+- The user asks for execution advice, buy/sell recommendations, or trade signals
+- The user asks about assets outside BTC/USD on Hyperliquid perps
+
+## Usage Notes
+
+- Returns measured facts first and a bounded interpretive read second
+- Data is driven by local market state built from Hyperliquid bootstrap + stream ingestion`;
+
+const RECENT_SESSIONS_DESCRIPTION = `Bounded recent-session context for BTC/USD on Hyperliquid.
+
+## When to Use
+
+- The user wants recent session context or comparison with recent history
+- The user asks how the current session differs from the last few UTC sessions
+
+## Usage Notes
+
+- Returns up to the last 7 completed UTC sessions
+- Includes compact comparison context against the live session`;
+
+const LEVEL_RESPONSE_DESCRIPTION = `Deterministic acceptance/rejection analysis for BTC/USD on Hyperliquid levels.
+
+## When to Use
+
+- The user asks if price is accepting or rejecting a level
+- The user refers to session open/high/low/VWAP or prior-session landmarks
+
+## Usage Notes
+
+- Accepts either an explicit price level or a named session landmark
+- Uses measured post-cross trade behavior and delta alignment to classify the response`;
+
+export function getToolRegistry(_model: string): RegisteredTool[] {
+  return [
+    {
+      name: 'market_context',
+      tool: marketContextTool,
+      description: MARKET_CONTEXT_DESCRIPTION,
+    },
+    {
+      name: 'recent_sessions',
+      tool: recentSessionsTool,
+      description: RECENT_SESSIONS_DESCRIPTION,
+    },
+    {
+      name: 'level_response',
+      tool: levelResponseTool,
+      description: LEVEL_RESPONSE_DESCRIPTION,
+    },
+  ];
+}
+
+export function getTools(model: string): StructuredToolInterface[] {
+  return getToolRegistry(model).map((tool) => tool.tool);
+}
+
+export function buildToolDescriptions(model: string): string {
+  return getToolRegistry(model)
+    .map((tool) => `### ${tool.name}\n\n${tool.description}`)
+    .join('\n\n');
+}
