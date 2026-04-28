@@ -239,6 +239,10 @@ export async function runCli() {
       query,
       commands: slashCommands,
       context: {
+        clear: () => {
+          agentRunner.clearHistory();
+          modelSelection.inMemoryChatHistory.clear();
+        },
         startModelSelection: () => modelSelection.startSelection(),
         showLocalResponse: (commandQuery, answer) => {
           agentRunner.recordLocalResponse(commandQuery, answer);
@@ -299,6 +303,10 @@ export async function runCli() {
   };
 
   const slashCommands = createSlashCommandRegistry({
+    clear: () => {
+      agentRunner.clearHistory();
+      modelSelection.inMemoryChatHistory.clear();
+    },
     startModelSelection: () => modelSelection.startSelection(),
     showLocalResponse: (query, answer) => {
       agentRunner.recordLocalResponse(query, answer);

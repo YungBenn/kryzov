@@ -69,6 +69,11 @@ export class AgentRunnerController {
     this.emitChange();
   }
 
+  clearHistory() {
+    this.historyValue = [];
+    this.emitChange();
+  }
+
   recordLocalResponse(query: string, answer: string) {
     const item: HistoryItem = {
       id: `local-${Date.now()}`,

@@ -7,12 +7,16 @@ import {
 
 function createHarness() {
   const calls = {
+    clear: 0,
     model: 0,
     quit: 0,
     responses: [] as Array<{ query: string; answer: string }>,
   };
 
   const context = {
+    clear: () => {
+      calls.clear += 1;
+    },
     startModelSelection: () => {
       calls.model += 1;
     },
@@ -31,6 +35,21 @@ function createHarness() {
 }
 
 describe('slash commands', () => {
+  test('/clear dispatches to the clear callback', async () => {
+    const { calls, commands, context } = createHarness();
+
+    const result = await dispatchSlashCommand({
+      query: '/clear',
+      commands,
+      context,
+      isBusy: false,
+    });
+
+    expect(result).toBe('handled');
+    expect(calls.clear).toBe(1);
+    expect(calls.responses).toHaveLength(0);
+  });
+
   test('/model dispatches to the model selection flow', async () => {
     const { calls, commands, context } = createHarness();
 
@@ -61,6 +80,7 @@ describe('slash commands', () => {
     expect(calls.quit).toBe(0);
     expect(calls.responses).toHaveLength(1);
     expect(calls.responses[0]?.answer).toContain('Available commands:');
+    expect(calls.responses[0]?.answer).toContain('/clear - Clear session transcript and context');
     expect(calls.responses[0]?.answer).toContain('/model - Change model or provider');
   });
 
@@ -93,6 +113,22 @@ describe('slash commands', () => {
     expect(calls.responses[0]?.answer).toContain("Unknown command '/unknown'.");
   });
 
+  test('commands with arguments return an argument error response', async () => {
+    const { calls, commands, context } = createHarness();
+
+    const result = await dispatchSlashCommand({
+      query: '/clear now',
+      commands,
+      context,
+      isBusy: false,
+    });
+
+    expect(result).toBe('handled');
+    expect(calls.clear).toBe(0);
+    expect(calls.responses).toHaveLength(1);
+    expect(calls.responses[0]?.answer).toContain("Command '/clear' does not take arguments.");
+  });
+
   test('busy state blocks non-exempt slash commands', async () => {
     const { calls, commands, context } = createHarness();
 
@@ -107,12 +143,28 @@ describe('slash commands', () => {
     expect(calls.responses).toHaveLength(0);
   });
 
+  test('/clear is blocked while busy', async () => {
+    const { calls, commands, context } = createHarness();
+
+    const result = await dispatchSlashCommand({
+      query: '/clear',
+      commands,
+      context,
+      isBusy: true,
+    });
+
+    expect(result).toBe('busy');
+    expect(calls.clear).toBe(0);
+    expect(calls.responses).toHaveLength(0);
+  });
+
   test('slash autocomplete suggests all commands for a bare slash', () => {
     const { provider } = createHarness();
 
     const suggestions = provider.getSuggestions(['/'], 0, 1);
 
     expect(suggestions?.items.map((item) => item.value)).toEqual([
+      'clear',
       'model',
       'help',
       'quit',
@@ -125,6 +177,14 @@ describe('slash commands', () => {
     const suggestions = provider.getSuggestions(['/mo'], 0, 3);
 
     expect(suggestions?.items.map((item) => item.value)).toEqual(['model']);
+  });
+
+  test('slash autocomplete matches the clear command prefix', () => {
+    const { provider } = createHarness();
+
+    const suggestions = provider.getSuggestions(['/cl'], 0, 3);
+
+    expect(suggestions?.items.map((item) => item.value)).toEqual(['clear']);
   });
 
   test('selecting a slash suggestion inserts the command into the input', () => {

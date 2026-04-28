@@ -4,6 +4,7 @@ import {
 } from '@mariozechner/pi-tui';
 
 export interface SlashCommandContext {
+  clear: () => void;
   startModelSelection: () => void;
   showLocalResponse: (query: string, answer: string) => void;
   quit: () => void;
@@ -64,6 +65,13 @@ export function createSlashCommandRegistry(
   _context: SlashCommandContext,
 ): SlashCommandDefinition[] {
   const commands: SlashCommandDefinition[] = [
+    {
+      name: 'clear',
+      description: 'Clear session transcript and context',
+      execute: (context) => {
+        context.clear();
+      },
+    },
     {
       name: 'model',
       description: 'Change model or provider',
