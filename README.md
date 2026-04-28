@@ -1,6 +1,6 @@
 # Kryzov
 
-Kryzov is a terminal-native BTC/USD market research agent for Hyperliquid derivatives. It reads measured session state, keeps answers short, and stays inside a narrow scope instead of drifting into signal-bot behavior.
+Kryzov is a terminal-native BTC/USD market research agent for Hyperliquid derivatives. It reads measured session state, responds concisely, and stays inside a narrow scope instead of drifting into signal-bot behavior.
 
 ![demo](demo.png)
 
