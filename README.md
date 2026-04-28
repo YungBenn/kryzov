@@ -131,7 +131,7 @@ bun run src/evals/run.ts --sample 10
 
 The eval dataset is Kryzov-specific and focuses on product scope, answer style, and bounded market reads.
 
-## Gateway
+## Gateway (NOT TESTED YET)
 
 Optional gateway flows are still available:
 
