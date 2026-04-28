@@ -2,7 +2,7 @@ import { AIMessage } from '@langchain/core/messages';
 import { StructuredToolInterface } from '@langchain/core/tools';
 import { callLlm, resolveAgentOllamaThink } from '../model/llm.js';
 import { getTools } from '../tools/registry.js';
-import { buildSystemPrompt, buildIterationPrompt, buildFinalAnswerPrompt } from '../agent/prompts.js';
+import { buildSystemPrompt, buildIterationPrompt, buildFinalAnswerPrompt, buildRewriteAnswerPrompt } from '../agent/prompts.js';
 import { extractTextContent, hasToolCalls } from '../utils/ai-message.js';
 import { InMemoryChatHistory } from '../utils/in-memory-chat-history.js';
 import { estimateTokens, CONTEXT_THRESHOLD, KEEP_TOOL_USES } from '../utils/tokens.js';
@@ -11,8 +11,14 @@ import { createRunContext, type RunContext } from './run-context.js';
 import { buildFinalAnswerContext } from './final-answer-context.js';
 import { AgentToolExecutor } from './tool-executor.js';
 import { assessKryzovScope } from './scope.js';
-import type { ToolCallRecord } from './scratchpad.js';
+import type { ToolCallRecord, ToolContext } from './scratchpad.js';
 import type { OllamaThinkSetting } from '../model/ollama-compat.js';
+import {
+  resolveAnswerMode,
+  shouldRewriteAnswer,
+  type AnswerMode,
+  type ComparisonRewriteContext,
+} from './answer-style.js';
 
 
 const DEFAULT_MODEL = 'gpt-5.2';
@@ -81,6 +87,7 @@ export class Agent {
 
     const ctx = createRunContext(query);
     const ollamaThink = resolveAgentOllamaThink(this.model, query);
+    const answerMode = resolveAnswerMode(query);
 
     // Build initial prompt with conversation history context
     let currentPrompt = this.buildInitialPrompt(query, inMemoryHistory);
@@ -105,17 +112,19 @@ export class Agent {
         // If no tools were called at all, just use the direct response
         // This handles greetings, clarifying questions, etc.
         if (!ctx.scratchpad.hasToolResults() && responseText) {
-          yield* this.emitFinalAnswer(responseText, ctx, []);
+          const finalAnswer = await this.maybeRewriteAnswer(responseText, ctx, answerMode, ollamaThink);
+          yield* this.emitFinalAnswer(finalAnswer, ctx, []);
           return;
         }
 
         if (responseText?.trim()) {
-          yield* this.emitFinalAnswer(responseText.trim(), ctx, ctx.scratchpad.getToolCallRecords());
+          const finalAnswer = await this.maybeRewriteAnswer(responseText.trim(), ctx, answerMode, ollamaThink);
+          yield* this.emitFinalAnswer(finalAnswer, ctx, ctx.scratchpad.getToolCallRecords());
           return;
         }
 
         // Generate final answer with full context from scratchpad
-        yield* this.generateFinalAnswer(ctx, undefined, ollamaThink);
+        yield* this.generateFinalAnswer(ctx, answerMode, undefined, ollamaThink);
         return;
       }
 
@@ -147,7 +156,7 @@ export class Agent {
     }
 
     // Max iterations reached - still generate proper final answer
-    yield* this.generateFinalAnswer(ctx, {
+    yield* this.generateFinalAnswer(ctx, answerMode, {
       fallbackMessage: `Reached maximum iterations (${this.maxIterations}).`,
     }, ollamaThink);
   }
@@ -198,6 +207,7 @@ export class Agent {
    */
   private async *generateFinalAnswer(
     ctx: RunContext,
+    answerMode: AnswerMode,
     options?: { fallbackMessage?: string },
     ollamaThink?: OllamaThinkSetting,
   ): AsyncGenerator<AgentEvent, void> {
@@ -210,11 +220,130 @@ export class Agent {
     const answer = typeof response === 'string'
       ? response
       : extractTextContent(response);
+    const finalAnswer = await this.maybeRewriteAnswer(answer, ctx, answerMode, ollamaThink);
     yield* this.emitFinalAnswer(
-      options?.fallbackMessage ? answer || options.fallbackMessage : answer,
+      options?.fallbackMessage ? finalAnswer || options.fallbackMessage : finalAnswer,
       ctx,
       ctx.scratchpad.getToolCallRecords(),
     );
+  }
+
+  private async maybeRewriteAnswer(
+    answer: string,
+    ctx: RunContext,
+    answerMode: AnswerMode,
+    ollamaThink?: OllamaThinkSetting,
+  ): Promise<string> {
+    const normalized = answer.trim();
+    const comparisonContext = this.getComparisonRewriteContext(ctx.scratchpad.getFullContexts());
+    if (
+      !normalized ||
+      !shouldRewriteAnswer(normalized, answerMode, {
+        query: ctx.query,
+        comparison: comparisonContext,
+      })
+    ) {
+      return normalized;
+    }
+
+    const rewritePrompt = buildRewriteAnswerPrompt(
+      ctx.query,
+      normalized,
+      answerMode,
+      this.formatComparisonRewriteContext(comparisonContext),
+    );
+    const { response, usage } = await this.callModel(rewritePrompt, false, ollamaThink);
+    ctx.tokenCounter.add(usage);
+    const rewritten = typeof response === 'string' ? response.trim() : extractTextContent(response)?.trim();
+    return rewritten || normalized;
+  }
+
+  private getComparisonRewriteContext(contexts: ToolContext[]): ComparisonRewriteContext | null {
+    for (let index = contexts.length - 1; index >= 0; index--) {
+      const ctx = contexts[index];
+      if (!ctx || (ctx.toolName !== 'recent_sessions' && ctx.toolName !== 'market_context')) {
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(ctx.result) as { data?: Record<string, unknown> };
+        const data = parsed.data && typeof parsed.data === 'object' ? parsed.data : null;
+        if (!data) {
+          continue;
+        }
+
+        const comparison = data.comparison as Record<string, unknown> | undefined;
+        const plainComparison = data.plainComparison as Record<string, unknown> | undefined;
+        if (!comparison || typeof comparison !== 'object') {
+          continue;
+        }
+
+        return {
+          rangeComparison:
+            comparison.rangeComparison === 'wider' ||
+            comparison.rangeComparison === 'narrower' ||
+            comparison.rangeComparison === 'similar'
+              ? comparison.rangeComparison
+              : null,
+          sessionVwapComparison:
+            comparison.sessionVwapComparison === 'higher' ||
+            comparison.sessionVwapComparison === 'lower' ||
+            comparison.sessionVwapComparison === 'similar'
+              ? comparison.sessionVwapComparison
+              : null,
+          currentFlowBias:
+            comparison.currentFlowBias === 'buy' ||
+            comparison.currentFlowBias === 'sell' ||
+            comparison.currentFlowBias === 'balanced'
+              ? comparison.currentFlowBias
+              : null,
+          plainComparison: plainComparison
+            ? {
+                takeaway: typeof plainComparison.takeaway === 'string' ? plainComparison.takeaway : null,
+                price: typeof plainComparison.price === 'string' ? plainComparison.price : null,
+                range: typeof plainComparison.range === 'string' ? plainComparison.range : null,
+                flow: typeof plainComparison.flow === 'string' ? plainComparison.flow : null,
+              }
+            : null,
+        };
+      } catch {
+        continue;
+      }
+    }
+
+    return null;
+  }
+
+  private formatComparisonRewriteContext(comparison: ComparisonRewriteContext | null): string | null {
+    if (!comparison) {
+      return null;
+    }
+
+    const lines: string[] = [];
+
+    if (comparison.rangeComparison) {
+      lines.push(`- Range vs recent average: ${comparison.rangeComparison}`);
+    }
+    if (comparison.sessionVwapComparison) {
+      lines.push(`- Session average price vs recent average: ${comparison.sessionVwapComparison}`);
+    }
+    if (comparison.currentFlowBias) {
+      lines.push(`- Current flow bias: ${comparison.currentFlowBias}`);
+    }
+    if (comparison.plainComparison?.takeaway) {
+      lines.push(`- Plain takeaway: ${comparison.plainComparison.takeaway}`);
+    }
+    if (comparison.plainComparison?.price) {
+      lines.push(`- Price summary: ${comparison.plainComparison.price}`);
+    }
+    if (comparison.plainComparison?.range) {
+      lines.push(`- Range summary: ${comparison.plainComparison.range}`);
+    }
+    if (comparison.plainComparison?.flow) {
+      lines.push(`- Flow summary: ${comparison.plainComparison.flow}`);
+    }
+
+    return lines.length > 0 ? lines.join('\n') : null;
   }
 
   /**

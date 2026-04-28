@@ -40,8 +40,20 @@ interface HyperliquidCandle {
 export interface MarketComparison {
   currentRange: number | null;
   recentAverageRange: number | null;
-  rangeVsRecentAverage: number | null;
-  sessionVwapDistance: number | null;
+  rangeRatioVsRecentAverage: number | null;
+  rangeComparison: 'wider' | 'narrower' | 'similar' | null;
+  recentAverageSessionVwap: number | null;
+  sessionVwapVsRecentAverage: number | null;
+  sessionVwapComparison: 'higher' | 'lower' | 'similar' | null;
+  currentFlowBias: 'buy' | 'sell' | 'balanced' | null;
+  recentFlowPattern: string | null;
+}
+
+export interface PlainComparisonSummary {
+  takeaway: string;
+  price: string;
+  range: string;
+  flow: string;
 }
 
 export interface MarketContextSnapshot extends PersistedSessionSummary {
@@ -188,7 +200,79 @@ function normalizeAssetContext(raw: unknown): MarketAssetContext | null {
   };
 }
 
-function computeComparison(
+function classifyRangeComparison(ratio: number | null): 'wider' | 'narrower' | 'similar' | null {
+  if (ratio === null) {
+    return null;
+  }
+
+  if (ratio >= 1.25) {
+    return 'wider';
+  }
+
+  if (ratio <= 0.8) {
+    return 'narrower';
+  }
+
+  return 'similar';
+}
+
+function classifyPriceComparison(diff: number | null): 'higher' | 'lower' | 'similar' | null {
+  if (diff === null) {
+    return null;
+  }
+
+  if (diff >= 100) {
+    return 'higher';
+  }
+
+  if (diff <= -100) {
+    return 'lower';
+  }
+
+  return 'similar';
+}
+
+function classifyFlowBias(buyPct: number, sellPct: number): 'buy' | 'sell' | 'balanced' {
+  const diff = buyPct - sellPct;
+
+  if (Math.abs(diff) < 4) {
+    return 'balanced';
+  }
+
+  return diff > 0 ? 'buy' : 'sell';
+}
+
+function summarizeRecentFlowPattern(recentSessions: PersistedSessionSummary[]): string | null {
+  if (recentSessions.length === 0) {
+    return null;
+  }
+
+  const oneSidedCount = recentSessions.filter((session) =>
+    Math.abs(session.sessionAggression.buyPct - session.sessionAggression.sellPct) >= 30,
+  ).length;
+  const buyCount = recentSessions.filter(
+    (session) => classifyFlowBias(session.sessionAggression.buyPct, session.sessionAggression.sellPct) === 'buy',
+  ).length;
+  const sellCount = recentSessions.filter(
+    (session) => classifyFlowBias(session.sessionAggression.buyPct, session.sessionAggression.sellPct) === 'sell',
+  ).length;
+
+  if (oneSidedCount >= Math.ceil(recentSessions.length * 0.6)) {
+    return 'recent sessions were mostly one-sided';
+  }
+
+  if (buyCount > sellCount) {
+    return 'recent sessions mostly leaned to buyers';
+  }
+
+  if (sellCount > buyCount) {
+    return 'recent sessions mostly leaned to sellers';
+  }
+
+  return 'recent sessions were mixed';
+}
+
+export function computeComparison(
   liveSession: PersistedSessionSummary,
   recentSessions: PersistedSessionSummary[],
 ): MarketComparison {
@@ -202,24 +286,83 @@ function computeComparison(
     recentRanges.length > 0
       ? recentRanges.reduce((sum, value) => sum + value, 0) / recentRanges.length
       : null;
+  const recentSessionVwaps = recentSessions
+    .map((session) => session.sessionVwap)
+    .filter((value): value is number => value !== null);
   const currentRange =
     liveSession.range.high !== null && liveSession.range.low !== null
       ? liveSession.range.high - liveSession.range.low
       : null;
-  const rangeVsRecentAverage =
+  const rangeRatioVsRecentAverage =
     currentRange !== null && recentAverageRange && recentAverageRange > 0
       ? currentRange / recentAverageRange
       : null;
-  const sessionVwapDistance =
-    liveSession.range.last !== null && liveSession.sessionVwap !== null
-      ? liveSession.range.last - liveSession.sessionVwap
+  const recentAverageSessionVwap =
+    recentSessionVwaps.length > 0
+      ? recentSessionVwaps.reduce((sum, value) => sum + value, 0) / recentSessionVwaps.length
+      : null;
+  const sessionVwapVsRecentAverage =
+    liveSession.sessionVwap !== null && recentAverageSessionVwap !== null
+      ? liveSession.sessionVwap - recentAverageSessionVwap
       : null;
 
   return {
     currentRange,
     recentAverageRange,
-    rangeVsRecentAverage,
-    sessionVwapDistance,
+    rangeRatioVsRecentAverage,
+    rangeComparison: classifyRangeComparison(rangeRatioVsRecentAverage),
+    recentAverageSessionVwap,
+    sessionVwapVsRecentAverage,
+    sessionVwapComparison: classifyPriceComparison(sessionVwapVsRecentAverage),
+    currentFlowBias: classifyFlowBias(
+      liveSession.sessionAggression.buyPct,
+      liveSession.sessionAggression.sellPct,
+    ),
+    recentFlowPattern: summarizeRecentFlowPattern(recentSessions),
+  };
+}
+
+export function buildPlainComparisonSummary(comparison: MarketComparison): PlainComparisonSummary {
+  const price =
+    comparison.sessionVwapComparison === 'lower'
+      ? 'Price is trading lower than the recent average.'
+      : comparison.sessionVwapComparison === 'higher'
+        ? 'Price is trading higher than the recent average.'
+        : 'Price is trading near the recent average.';
+  const range =
+    comparison.rangeComparison === 'wider'
+      ? 'The session range is wider than the recent average.'
+      : comparison.rangeComparison === 'narrower'
+        ? 'The session range is narrower than the recent average.'
+        : 'The session range is close to the recent average.';
+  const flow =
+    comparison.currentFlowBias === 'sell'
+      ? 'Sellers still have a small sell edge today.'
+      : comparison.currentFlowBias === 'buy'
+        ? 'Buyers still have a small buy edge today.'
+        : 'Order flow is broadly balanced today.';
+
+  const takeawayParts: string[] = [];
+  if (comparison.sessionVwapComparison === 'lower') {
+    takeawayParts.push('lower in price');
+  } else if (comparison.sessionVwapComparison === 'higher') {
+    takeawayParts.push('higher in price');
+  }
+
+  if (comparison.recentFlowPattern?.includes('one-sided') || comparison.currentFlowBias === 'balanced') {
+    takeawayParts.push('more balanced');
+  }
+
+  const takeaway =
+    takeawayParts.length > 0
+      ? `The current session is ${takeawayParts.join(' and ')} than the recent sessions.`
+      : 'The current session is broadly similar to the recent sessions.';
+
+  return {
+    takeaway,
+    price,
+    range,
+    flow,
   };
 }
 
@@ -295,14 +438,17 @@ export class MarketStateService {
   async getRecentSessions(limit = 7): Promise<{
     sessions: PersistedSessionSummary[];
     comparison: MarketComparison;
+    plainComparison: PlainComparisonSummary;
     liveSession: PersistedSessionSummary;
   }> {
     await this.ensureStarted();
     const liveSession = await this.buildLiveSessionSnapshot();
     const sessions = this.store.loadCompletedSessions().slice(-limit);
+    const comparison = computeComparison(liveSession, sessions);
     return {
       sessions,
-      comparison: computeComparison(liveSession, sessions),
+      comparison,
+      plainComparison: buildPlainComparisonSummary(comparison),
       liveSession,
     };
   }
