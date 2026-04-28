@@ -26,7 +26,7 @@ describe('THINKING_VERBS', () => {
 describe('getRandomThinkingVerb', () => {
   test('always returns a verb from the curated list', () => {
     for (let i = 0; i < 100; i++) {
-      expect(THINKING_VERBS).toContain(getRandomThinkingVerb());
+      expect(THINKING_VERBS as readonly string[]).toContain(getRandomThinkingVerb());
     }
   });
 });

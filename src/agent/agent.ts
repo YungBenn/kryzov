@@ -1,6 +1,6 @@
 import { AIMessage } from '@langchain/core/messages';
 import { StructuredToolInterface } from '@langchain/core/tools';
-import { callLlm } from '../model/llm.js';
+import { callLlm, resolveAgentOllamaThink } from '../model/llm.js';
 import { getTools } from '../tools/registry.js';
 import { buildSystemPrompt, buildIterationPrompt, buildFinalAnswerPrompt } from '../agent/prompts.js';
 import { extractTextContent, hasToolCalls } from '../utils/ai-message.js';
@@ -11,6 +11,8 @@ import { createRunContext, type RunContext } from './run-context.js';
 import { buildFinalAnswerContext } from './final-answer-context.js';
 import { AgentToolExecutor } from './tool-executor.js';
 import { assessKryzovScope } from './scope.js';
+import type { ToolCallRecord } from './scratchpad.js';
+import type { OllamaThinkSetting } from '../model/ollama-compat.js';
 
 
 const DEFAULT_MODEL = 'gpt-5.2';
@@ -78,6 +80,7 @@ export class Agent {
     }
 
     const ctx = createRunContext(query);
+    const ollamaThink = resolveAgentOllamaThink(this.model, query);
 
     // Build initial prompt with conversation history context
     let currentPrompt = this.buildInitialPrompt(query, inMemoryHistory);
@@ -86,7 +89,7 @@ export class Agent {
     while (ctx.iteration < this.maxIterations) {
       ctx.iteration++;
 
-      const { response, usage } = await this.callModel(currentPrompt);
+      const { response, usage } = await this.callModel(currentPrompt, true, ollamaThink);
       ctx.tokenCounter.add(usage);
       const responseText = typeof response === 'string' ? response : extractTextContent(response);
 
@@ -102,12 +105,17 @@ export class Agent {
         // If no tools were called at all, just use the direct response
         // This handles greetings, clarifying questions, etc.
         if (!ctx.scratchpad.hasToolResults() && responseText) {
-          yield* this.handleDirectResponse(responseText, ctx);
+          yield* this.emitFinalAnswer(responseText, ctx, []);
+          return;
+        }
+
+        if (responseText?.trim()) {
+          yield* this.emitFinalAnswer(responseText.trim(), ctx, ctx.scratchpad.getToolCallRecords());
           return;
         }
 
         // Generate final answer with full context from scratchpad
-        yield* this.generateFinalAnswer(ctx);
+        yield* this.generateFinalAnswer(ctx, undefined, ollamaThink);
         return;
       }
 
@@ -141,7 +149,7 @@ export class Agent {
     // Max iterations reached - still generate proper final answer
     yield* this.generateFinalAnswer(ctx, {
       fallbackMessage: `Reached maximum iterations (${this.maxIterations}).`,
-    });
+    }, ollamaThink);
   }
 
   /**
@@ -149,12 +157,17 @@ export class Agent {
    * @param prompt - The prompt to send to the LLM
    * @param useTools - Whether to bind tools (default: true). When false, returns string directly.
    */
-  private async callModel(prompt: string, useTools: boolean = true): Promise<{ response: AIMessage | string; usage?: TokenUsage }> {
+  private async callModel(
+    prompt: string,
+    useTools: boolean = true,
+    ollamaThink?: OllamaThinkSetting,
+  ): Promise<{ response: AIMessage | string; usage?: TokenUsage }> {
     const result = await callLlm(prompt, {
       model: this.model,
       systemPrompt: this.systemPrompt,
       tools: useTools ? this.tools : undefined,
       signal: this.signal,
+      ollamaThink,
     });
     return { response: result.response, usage: result.usage };
   }
@@ -162,16 +175,17 @@ export class Agent {
   /**
    * Generate final answer with full scratchpad context.
    */
-  private async *handleDirectResponse(
-    responseText: string,
-    ctx: RunContext
+  private async *emitFinalAnswer(
+    answer: string,
+    ctx: RunContext,
+    toolCalls: ToolCallRecord[],
   ): AsyncGenerator<AgentEvent, void> {
     yield { type: 'answer_start' };
     const totalTime = Date.now() - ctx.startTime;
     yield {
       type: 'done',
-      answer: responseText,
-      toolCalls: [],
+      answer,
+      toolCalls,
       iterations: ctx.iteration,
       totalTime,
       tokenUsage: ctx.tokenCounter.getUsage(),
@@ -184,28 +198,23 @@ export class Agent {
    */
   private async *generateFinalAnswer(
     ctx: RunContext,
-    options?: { fallbackMessage?: string }
+    options?: { fallbackMessage?: string },
+    ollamaThink?: OllamaThinkSetting,
   ): AsyncGenerator<AgentEvent, void> {
     const fullContext = buildFinalAnswerContext(ctx.scratchpad);
     const finalPrompt = buildFinalAnswerPrompt(ctx.query, fullContext);
 
     yield { type: 'answer_start' };
-    const { response, usage } = await this.callModel(finalPrompt, false);
+    const { response, usage } = await this.callModel(finalPrompt, false, ollamaThink);
     ctx.tokenCounter.add(usage);
     const answer = typeof response === 'string'
       ? response
       : extractTextContent(response);
-
-    const totalTime = Date.now() - ctx.startTime;
-    yield {
-      type: 'done',
-      answer: options?.fallbackMessage ? answer || options.fallbackMessage : answer,
-      toolCalls: ctx.scratchpad.getToolCallRecords(),
-      iterations: ctx.iteration,
-      totalTime,
-      tokenUsage: ctx.tokenCounter.getUsage(),
-      tokensPerSecond: ctx.tokenCounter.getTokensPerSecond(totalTime),
-    };
+    yield* this.emitFinalAnswer(
+      options?.fallbackMessage ? answer || options.fallbackMessage : answer,
+      ctx,
+      ctx.scratchpad.getToolCallRecords(),
+    );
   }
 
   /**

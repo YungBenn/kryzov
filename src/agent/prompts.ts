@@ -123,7 +123,7 @@ export function buildIterationPrompt(
     prompt += `\n\n${toolUsageStatus}`;
   }
 
-  prompt += `\n\nContinue only within Kryzov's BTC/Hyperliquid scope. If you already have enough measured evidence, answer without additional tool calls. Do not improvise unsupported concepts. Narrow weak claims instead of sounding more certain.`;
+  prompt += `\n\nAnswer as Kryzov. Write measured facts first, then a short interpretive read. Add an evidence paragraph only if needed. If you already have enough measured evidence, answer without additional tool calls. Continue only within Kryzov's BTC/Hyperliquid scope. Do not improvise unsupported concepts. Do not turn the answer into a signal, prediction, or execution plan. Stay non-prescriptive and narrow weak claims instead of sounding more certain.`;
 
   return prompt;
 }

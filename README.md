@@ -32,7 +32,7 @@ Kryzov is a terminal-native BTC/USD market research agent for Hyperliquid deriva
 git clone https://github.com/YungBenn/kryzov.git
 cd kryzov
 bun install
-cp env.example .env
+cp .env.example .env
 ```
 
 ## Configure

@@ -2,7 +2,6 @@ import { AIMessage } from '@langchain/core/messages';
 import { ChatOpenAI } from '@langchain/openai';
 import { ChatAnthropic } from '@langchain/anthropic';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
-import { ChatOllama } from '@langchain/ollama';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
 import { SystemMessage, HumanMessage } from '@langchain/core/messages';
 import { BaseChatModel } from '@langchain/core/language_models/chat_models';
@@ -13,6 +12,16 @@ import { DEFAULT_SYSTEM_PROMPT } from '@/agent/prompts';
 import type { TokenUsage } from '@/agent/types';
 import { logger } from '@/utils';
 import { resolveProvider, getProviderById } from '@/providers';
+import {
+  createKryzovChatOllama,
+  getOllamaThinkCapability,
+  validateOllamaThinkForModel,
+} from './ollama-compat.js';
+import type {
+  KryzovChatOllamaInput,
+  OllamaConfiguredThinkSetting,
+  OllamaThinkSetting,
+} from './ollama-compat.js';
 
 export const DEFAULT_PROVIDER = 'openai';
 export const DEFAULT_MODEL = 'gpt-5.2';
@@ -46,6 +55,7 @@ async function withRetry<T>(fn: () => Promise<T>, provider: string, maxAttempts 
 // Model provider configuration
 interface ModelOpts {
   streaming: boolean;
+  ollamaThink?: OllamaThinkSetting;
 }
 
 type ModelFactory = (name: string, opts: ModelOpts) => BaseChatModel;
@@ -56,6 +66,49 @@ function getApiKey(envVar: string): string {
     throw new Error(`[LLM] ${envVar} not found in environment variables`);
   }
   return apiKey;
+}
+
+function getConfiguredOllamaThinkSetting(): OllamaConfiguredThinkSetting {
+  const raw = process.env.KRYZOV_OLLAMA_THINK?.trim().toLowerCase();
+
+  switch (raw) {
+    case 'auto':
+      return 'auto';
+    case 'true':
+      return true;
+    case 'low':
+    case 'medium':
+    case 'high':
+      return raw;
+    case 'false':
+    case undefined:
+    case '':
+      return false;
+    default:
+      return false;
+  }
+}
+
+function getEffectiveOllamaThinkSetting(override?: OllamaThinkSetting): OllamaThinkSetting {
+  if (override !== undefined) {
+    return override;
+  }
+
+  const configured = getConfiguredOllamaThinkSetting();
+  if (configured === 'auto') {
+    return false;
+  }
+
+  return configured;
+}
+
+function resolveOllamaThinkSetting(
+  modelName: string,
+  override?: OllamaThinkSetting,
+): OllamaThinkSetting {
+  const effectiveThink = getEffectiveOllamaThinkSetting(override);
+  validateOllamaThinkForModel(modelName, effectiveThink);
+  return effectiveThink;
 }
 
 // Factories keyed by provider id — prefix routing is handled by resolveProvider()
@@ -108,12 +161,15 @@ const MODEL_FACTORIES: Record<string, ModelFactory> = {
         baseURL: 'https://api.deepseek.com',
       },
     }),
-  ollama: (name, opts) =>
-    new ChatOllama({
+  ollama: (name, opts) => {
+    const fields: KryzovChatOllamaInput = {
       model: name.replace(/^ollama:/, ''),
       ...opts,
+      think: resolveOllamaThinkSetting(name, opts.ollamaThink),
       ...(process.env.OLLAMA_BASE_URL ? { baseUrl: process.env.OLLAMA_BASE_URL } : {}),
-    }),
+    };
+    return createKryzovChatOllama(fields);
+  },
 };
 
 const DEFAULT_FACTORY: ModelFactory = (name, opts) =>
@@ -125,9 +181,10 @@ const DEFAULT_FACTORY: ModelFactory = (name, opts) =>
 
 export function getChatModel(
   modelName: string = DEFAULT_MODEL,
-  streaming: boolean = false
+  streaming: boolean = false,
+  options: Pick<ModelOpts, 'ollamaThink'> = {},
 ): BaseChatModel {
-  const opts: ModelOpts = { streaming };
+  const opts: ModelOpts = { streaming, ...options };
   const provider = resolveProvider(modelName);
   const factory = MODEL_FACTORIES[provider.id] ?? DEFAULT_FACTORY;
   return factory(modelName, opts);
@@ -139,11 +196,67 @@ interface CallLlmOptions {
   outputSchema?: z.ZodType<unknown>;
   tools?: StructuredToolInterface[];
   signal?: AbortSignal;
+  ollamaThink?: OllamaThinkSetting;
 }
 
 export interface LlmResult {
   response: AIMessage | string;
   usage?: TokenUsage;
+}
+
+export function resolveAutoOllamaThink(query: string): OllamaThinkSetting {
+  const normalized = query.toLowerCase();
+
+  const complexPatterns = [
+    /\bdivergence\b/,
+    /\bcompare\b.*\b(last|previous|recent|\d+\s+sessions?)\b/,
+    /\b(explain|why)\b.*\b(divergence|difference|vs|versus)\b/,
+    /\bcompare and interpret\b/,
+    /\bsynthesi[sz]e\b/,
+    /\bwalk me through\b/,
+  ];
+
+  if (complexPatterns.some((pattern) => pattern.test(normalized))) {
+    return 'medium';
+  }
+
+  const moderatePatterns = [
+    /\baccepting\b/,
+    /\brejecting\b/,
+    /\bacceptance\b/,
+    /\brejection\b/,
+    /\blevel response\b/,
+    /\bwhat does this mean\b/,
+    /\binterpret\b/,
+    /\bread this\b/,
+    /\brecent sessions?\b/,
+    /\bcompare\b/,
+    /\bversus\b/,
+    /\bvs\b/,
+  ];
+
+  if (moderatePatterns.some((pattern) => pattern.test(normalized))) {
+    return 'low';
+  }
+
+  return false;
+}
+
+export function resolveAgentOllamaThink(modelName: string, query: string): OllamaThinkSetting | undefined {
+  if (resolveProvider(modelName).id !== 'ollama') {
+    return undefined;
+  }
+
+  if (getConfiguredOllamaThinkSetting() !== 'auto') {
+    return undefined;
+  }
+
+  const resolved = resolveAutoOllamaThink(query);
+  if (resolved === false && getOllamaThinkCapability(modelName) === 'level') {
+    return 'low';
+  }
+
+  return resolved;
 }
 
 function extractUsage(result: unknown): TokenUsage | undefined {
@@ -195,10 +308,15 @@ function buildAnthropicMessages(systemPrompt: string, userPrompt: string) {
 }
 
 export async function callLlm(prompt: string, options: CallLlmOptions = {}): Promise<LlmResult> {
-  const { model = DEFAULT_MODEL, systemPrompt, outputSchema, tools, signal } = options;
+  const { model = DEFAULT_MODEL, systemPrompt, outputSchema, tools, signal, ollamaThink } = options;
   const finalSystemPrompt = systemPrompt || DEFAULT_SYSTEM_PROMPT;
+  const provider = resolveProvider(model);
 
-  const llm = getChatModel(model, false);
+  if (provider.id === 'ollama' && ollamaThink !== undefined) {
+    validateOllamaThinkForModel(model, ollamaThink);
+  }
+
+  const llm = getChatModel(model, false, { ollamaThink });
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let runnable: Runnable<any, any> = llm;
@@ -210,7 +328,6 @@ export async function callLlm(prompt: string, options: CallLlmOptions = {}): Pro
   }
 
   const invokeOpts = signal ? { signal } : undefined;
-  const provider = resolveProvider(model);
   let result;
 
   if (provider.id === 'anthropic') {

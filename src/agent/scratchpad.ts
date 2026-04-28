@@ -226,12 +226,14 @@ export class Scratchpad {
    */
   formatToolUsageForPrompt(): string | null {
     const statuses = this.getToolUsageStatus();
-    
-    if (statuses.length === 0) {
+
+    const noteworthyStatuses = statuses.filter((status) => status.callCount >= status.maxCalls - 1);
+
+    if (noteworthyStatuses.length === 0) {
       return null;
     }
 
-    const lines = statuses.map(s => {
+    const lines = noteworthyStatuses.map(s => {
       const status = s.callCount >= s.maxCalls
         ? `${s.callCount} calls (over suggested limit of ${s.maxCalls})`
         : `${s.callCount}/${s.maxCalls} calls`;

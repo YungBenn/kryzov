@@ -5,6 +5,7 @@ export interface RegisteredTool {
   name: string;
   tool: StructuredToolInterface;
   description: string;
+  promptDescription: string;
 }
 
 const MARKET_CONTEXT_DESCRIPTION = `Measured BTC/USD session state on Hyperliquid.
@@ -55,16 +56,19 @@ export function getToolRegistry(_model: string): RegisteredTool[] {
       name: 'market_context',
       tool: marketContextTool,
       description: MARKET_CONTEXT_DESCRIPTION,
+      promptDescription: 'market_context: current BTC/USD Hyperliquid session state',
     },
     {
       name: 'recent_sessions',
       tool: recentSessionsTool,
       description: RECENT_SESSIONS_DESCRIPTION,
+      promptDescription: 'recent_sessions: recent completed BTC/USD Hyperliquid sessions for comparison',
     },
     {
       name: 'level_response',
       tool: levelResponseTool,
       description: LEVEL_RESPONSE_DESCRIPTION,
+      promptDescription: 'level_response: measured acceptance/rejection analysis for explicit levels or session landmarks',
     },
   ];
 }
@@ -75,6 +79,6 @@ export function getTools(model: string): StructuredToolInterface[] {
 
 export function buildToolDescriptions(model: string): string {
   return getToolRegistry(model)
-    .map((tool) => `### ${tool.name}\n\n${tool.description}`)
-    .join('\n\n');
+    .map((tool) => tool.promptDescription)
+    .join('\n');
 }

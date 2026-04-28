@@ -24,7 +24,7 @@ export function buildFinalAnswerContext(scratchpad: Scratchpad): string {
 function formatToolContext(ctx: ToolContext): string {
   const description = getToolDescription(ctx.toolName, ctx.args);
   try {
-    return `### ${description}\n\`\`\`json\n${JSON.stringify(JSON.parse(ctx.result), null, 2)}\n\`\`\``;
+    return `### ${description}\n${JSON.stringify(JSON.parse(ctx.result))}`;
   } catch {
     // If result is not valid JSON, return as-is
     return `### ${description}\n${ctx.result}`;
