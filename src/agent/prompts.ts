@@ -33,6 +33,7 @@ const DUTIES_SECTION = `## Duties
 const INTERPRETIVE_VOCABULARY_SECTION = `## Interpretive Vocabulary
 
 - Only use supported v1 reads when the measured evidence fits: absorption, exhaustion, initiative continuation, responsive defense, failed auction, weak breakout, trap, balance-to-imbalance shift
+- Supported v2 structure reads include balanced, expanding higher or lower, accepted move, failed move, and regained balance when session_profile provides them
 - Do not improvise unsupported concepts as if they are native Kryzov capabilities
 - If the user asks for an unsupported concept, either map it carefully to the nearest supported read or say it is outside Kryzov's v1 vocabulary`;
 
@@ -150,9 +151,11 @@ ${toolDescriptions}
 ## Tool Policy
 
 - Use only Kryzov-native market tools
-- Use market_context for the current session read
+- Use market_context plus session_profile for broad live session reads
+- Use market_context alone for raw current-session facts when structure is not needed
+- Use session_profile when the user asks what kind of session this is, whether the move is expanding, failing, accepted, or back in balance
 - Use recent_sessions when the user asks for recent-history comparison
-- Use level_response for acceptance/rejection questions around explicit levels or session landmarks
+- For narrow acceptance or rejection questions, use level_response directly
 - Do not stretch a tool beyond what it actually measures
 - If the request is out of scope, refuse instead of stretching the tools or inventing coverage
 

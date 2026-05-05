@@ -111,8 +111,11 @@ describe('buildSystemPrompt', () => {
     const prompt = buildSystemPrompt('gpt-5.2');
 
     expect(prompt).toContain('market_context: current BTC/USD Hyperliquid session state');
+    expect(prompt).toContain('session_profile: computed BTC/USD Hyperliquid session structure and transition state');
     expect(prompt).toContain('recent_sessions: recent completed BTC/USD Hyperliquid sessions for comparison');
     expect(prompt).toContain('level_response: measured acceptance/rejection analysis for explicit levels or session landmarks');
+    expect(prompt).toContain('Use market_context plus session_profile for broad live session reads');
+    expect(prompt).toContain('For narrow acceptance or rejection questions, use level_response directly');
     expect(prompt).not.toContain('## When to Use');
     expect(prompt).not.toContain('## When NOT to Use');
     expect(prompt).not.toContain('## Usage Notes');

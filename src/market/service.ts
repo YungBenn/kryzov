@@ -2,10 +2,12 @@ import {
   analyzeLevelResponse,
   classifyAuctionBehavior,
   computeSessionMetrics,
+  deriveSessionProfile,
   deriveInterpretiveRead,
   getUtcSessionStart,
   type LevelResponse,
   type MarketTrade,
+  type SessionProfile,
   type SessionMetrics,
 } from './analytics.js';
 import {
@@ -58,6 +60,16 @@ export interface PlainComparisonSummary {
 
 export interface MarketContextSnapshot extends PersistedSessionSummary {
   comparison: MarketComparison;
+  levelReferences: Record<string, number | null>;
+  connection: {
+    wsConnected: boolean;
+    bootstrapOnly: boolean;
+  };
+}
+
+export interface SessionProfileSnapshot {
+  profile: SessionProfile;
+  liveSession: PersistedSessionSummary;
   levelReferences: Record<string, number | null>;
   connection: {
     wsConnected: boolean;
@@ -450,6 +462,43 @@ export class MarketStateService {
       comparison,
       plainComparison: buildPlainComparisonSummary(comparison),
       liveSession,
+    };
+  }
+
+  async getSessionProfile(): Promise<SessionProfileSnapshot> {
+    await this.ensureStarted();
+    const liveSession = await this.buildLiveSessionSnapshot();
+    const recentSessions = this.store.loadCompletedSessions();
+    const levelReferences = getLevelReferences(liveSession, recentSessions);
+    const trades = [...this.bootstrapTrades, ...this.liveTrades];
+
+    return {
+      profile: deriveSessionProfile({
+        metrics: {
+          sessionStart: liveSession.sessionStart,
+          now: liveSession.sessionEnd,
+          sessionVwap: liveSession.sessionVwap,
+          rolling30mVwap: liveSession.rolling30mVwap,
+          cumulativeDelta: liveSession.cumulativeDelta,
+          sessionAggression: liveSession.sessionAggression,
+          trailing5mAggression: liveSession.trailing5mAggression,
+          range: liveSession.range,
+          tradeCount: liveSession.tradeCount,
+          totalVolume: liveSession.totalVolume,
+          lastTradeTimestamp: liveSession.lastTradeTimestamp,
+        },
+        trades,
+        now: Date.now(),
+        freshness: liveSession.freshness,
+        recentSessions,
+        levelReferences,
+      }),
+      liveSession,
+      levelReferences,
+      connection: {
+        wsConnected: this.wsConnected,
+        bootstrapOnly: this.liveTrades.length === 0,
+      },
     };
   }
 

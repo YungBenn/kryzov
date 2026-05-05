@@ -3,6 +3,7 @@ import {
   analyzeLevelResponse,
   classifyAuctionBehavior,
   computeSessionMetrics,
+  deriveSessionProfile,
   deriveInterpretiveRead,
   getUtcSessionStart,
   type MarketTrade,
@@ -139,5 +140,168 @@ describe('deriveInterpretiveRead', () => {
     expect(read.label).toBe('initiative_continuation');
     expect(read.phrase).toContain('reads as');
     expect(read.evidence.length).toBeGreaterThan(0);
+  });
+});
+
+describe('deriveSessionProfile', () => {
+  test('classifies a balanced rotation session', () => {
+    const metrics = computeSessionMetrics({
+      trades: [
+        trade('2026-04-27T00:10:00.000Z', 100, 1, 'B'),
+        trade('2026-04-27T00:11:00.000Z', 102, 1, 'A'),
+        trade('2026-04-27T00:12:00.000Z', 101, 1, 'B'),
+        trade('2026-04-27T00:13:00.000Z', 100.5, 1, 'A'),
+      ],
+      now: Date.parse('2026-04-27T00:14:00.000Z'),
+      sessionStart: Date.parse('2026-04-27T00:00:00.000Z'),
+    });
+
+    const profile = deriveSessionProfile({
+      metrics,
+      trades: [
+        trade('2026-04-27T00:10:00.000Z', 100, 1, 'B'),
+        trade('2026-04-27T00:11:00.000Z', 102, 1, 'A'),
+        trade('2026-04-27T00:12:00.000Z', 101, 1, 'B'),
+        trade('2026-04-27T00:13:00.000Z', 100.5, 1, 'A'),
+      ],
+      now: Date.parse('2026-04-27T00:14:00.000Z'),
+      freshness: {
+        lastTradeAt: Date.parse('2026-04-27T00:13:00.000Z'),
+        lastAssetContextAt: null,
+        updatedAt: Date.parse('2026-04-27T00:14:00.000Z'),
+      },
+      recentSessions: [],
+      levelReferences: {
+        session_open: 100,
+        session_high: 102,
+        session_low: 100,
+        session_vwap: 101,
+        prior_session_high: null,
+        prior_session_low: null,
+        prior_session_vwap: null,
+      },
+    });
+
+    expect(profile.state).toBe('balanced');
+    expect(profile.bias).toBe('balanced');
+    expect(profile.confidence).toBe('medium');
+    expect(profile.transition).toBeNull();
+  });
+
+  test('classifies upside expansion and acceptance', () => {
+    const trades = [
+      trade('2026-04-27T00:10:00.000Z', 100, 1, 'B'),
+      trade('2026-04-27T00:11:00.000Z', 101.5, 1.5, 'B'),
+      trade('2026-04-27T00:12:00.000Z', 103, 2, 'B'),
+      trade('2026-04-27T00:13:00.000Z', 104, 2, 'B'),
+      trade('2026-04-27T00:14:00.000Z', 104.5, 1, 'B'),
+    ];
+    const metrics = computeSessionMetrics({
+      trades,
+      now: Date.parse('2026-04-27T00:15:00.000Z'),
+      sessionStart: Date.parse('2026-04-27T00:00:00.000Z'),
+    });
+
+    const profile = deriveSessionProfile({
+      metrics,
+      trades,
+      now: Date.parse('2026-04-27T00:15:00.000Z'),
+      freshness: {
+        lastTradeAt: Date.parse('2026-04-27T00:14:00.000Z'),
+        lastAssetContextAt: null,
+        updatedAt: Date.parse('2026-04-27T00:15:00.000Z'),
+      },
+      recentSessions: [],
+      levelReferences: {
+        session_open: 100,
+        session_high: 104.5,
+        session_low: 100,
+        session_vwap: metrics.sessionVwap,
+        prior_session_high: null,
+        prior_session_low: null,
+        prior_session_vwap: null,
+      },
+    });
+
+    expect(profile.state).toBe('accepted_up');
+    expect(profile.bias).toBe('buy');
+    expect(profile.confidence).toBe('high');
+    expect(profile.transition?.to).toBe('accepted_up');
+  });
+
+  test('classifies a failed upside move', () => {
+    const trades = [
+      trade('2026-04-27T00:10:00.000Z', 100, 1, 'B'),
+      trade('2026-04-27T00:11:00.000Z', 103, 2, 'B'),
+      trade('2026-04-27T00:12:00.000Z', 104, 1, 'B'),
+      trade('2026-04-27T00:13:00.000Z', 101, 2, 'A'),
+      trade('2026-04-27T00:14:00.000Z', 100.5, 1.5, 'A'),
+    ];
+    const metrics = computeSessionMetrics({
+      trades,
+      now: Date.parse('2026-04-27T00:15:00.000Z'),
+      sessionStart: Date.parse('2026-04-27T00:00:00.000Z'),
+    });
+
+    const profile = deriveSessionProfile({
+      metrics,
+      trades,
+      now: Date.parse('2026-04-27T00:15:00.000Z'),
+      freshness: {
+        lastTradeAt: Date.parse('2026-04-27T00:14:00.000Z'),
+        lastAssetContextAt: null,
+        updatedAt: Date.parse('2026-04-27T00:15:00.000Z'),
+      },
+      recentSessions: [],
+      levelReferences: {
+        session_open: 100,
+        session_high: 104,
+        session_low: 100,
+        session_vwap: metrics.sessionVwap,
+        prior_session_high: null,
+        prior_session_low: null,
+        prior_session_vwap: null,
+      },
+    });
+
+    expect(profile.state).toBe('failed_up');
+    expect(profile.bias).toBe('sell');
+    expect(profile.transition?.to).toBe('failed_up');
+  });
+
+  test('degrades confidence and adds a caveat when the session is stale', () => {
+    const trades = [
+      trade('2026-04-27T00:10:00.000Z', 100, 1, 'B'),
+      trade('2026-04-27T00:11:00.000Z', 100.5, 1, 'A'),
+    ];
+    const metrics = computeSessionMetrics({
+      trades,
+      now: Date.parse('2026-04-27T01:00:00.000Z'),
+      sessionStart: Date.parse('2026-04-27T00:00:00.000Z'),
+    });
+
+    const profile = deriveSessionProfile({
+      metrics,
+      trades,
+      now: Date.parse('2026-04-27T01:00:00.000Z'),
+      freshness: {
+        lastTradeAt: Date.parse('2026-04-27T00:11:00.000Z'),
+        lastAssetContextAt: null,
+        updatedAt: Date.parse('2026-04-27T01:00:00.000Z'),
+      },
+      recentSessions: [],
+      levelReferences: {
+        session_open: 100,
+        session_high: 100.5,
+        session_low: 100,
+        session_vwap: metrics.sessionVwap,
+        prior_session_high: null,
+        prior_session_low: null,
+        prior_session_vwap: null,
+      },
+    });
+
+    expect(profile.confidence).toBe('low');
+    expect(profile.caveat).toBeTruthy();
   });
 });

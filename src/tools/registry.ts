@@ -1,5 +1,5 @@
 import { StructuredToolInterface } from '@langchain/core/tools';
-import { levelResponseTool, marketContextTool, recentSessionsTool } from './market/index.js';
+import { levelResponseTool, marketContextTool, recentSessionsTool, sessionProfileTool } from './market/index.js';
 
 export interface RegisteredTool {
   name: string;
@@ -38,6 +38,19 @@ const RECENT_SESSIONS_DESCRIPTION = `Bounded recent-session context for BTC/USD 
 - Returns up to the last 7 completed UTC sessions
 - Includes compact comparison context against the live session`;
 
+const SESSION_PROFILE_DESCRIPTION = `Computed session structure for BTC/USD on Hyperliquid.
+
+## When to Use
+
+- The user asks what kind of session this is right now
+- The user wants current structure, expansion, failure, or balance-to-imbalance state
+- The user wants the current directional bias and latest clear transition
+
+## Usage Notes
+
+- Returns deterministic session state, confidence, and brief evidence
+- Keeps structure labels computed in code so the model does not invent them`;
+
 const LEVEL_RESPONSE_DESCRIPTION = `Deterministic acceptance/rejection analysis for BTC/USD on Hyperliquid levels.
 
 ## When to Use
@@ -57,6 +70,12 @@ export function getToolRegistry(_model: string): RegisteredTool[] {
       tool: marketContextTool,
       description: MARKET_CONTEXT_DESCRIPTION,
       promptDescription: 'market_context: current BTC/USD Hyperliquid session state',
+    },
+    {
+      name: 'session_profile',
+      tool: sessionProfileTool,
+      description: SESSION_PROFILE_DESCRIPTION,
+      promptDescription: 'session_profile: computed BTC/USD Hyperliquid session structure and transition state',
     },
     {
       name: 'recent_sessions',

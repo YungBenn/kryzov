@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   buildPlainComparisonSummary,
   computeComparison,
+  MarketStateService,
   type MarketComparison,
 } from './service.js';
 import type { PersistedSessionSummary } from './store.js';
@@ -114,5 +115,37 @@ describe('buildPlainComparisonSummary', () => {
     expect(summary.takeaway).toContain('more balanced');
     expect(summary.range).toContain('wider');
     expect(summary.flow).toContain('small sell edge');
+  });
+});
+
+describe('MarketStateService.getSessionProfile', () => {
+  test('returns the computed session profile payload', async () => {
+    const service = MarketStateService.getInstance() as any;
+
+    const liveSession = session({
+      sessionDate: '2026-04-28',
+      high: 104,
+      low: 100,
+      last: 103.5,
+      sessionVwap: 102,
+      buyPct: 60,
+      sellPct: 40,
+    });
+
+    service.ensureStarted = async () => {};
+    service.buildLiveSessionSnapshot = async () => liveSession;
+    service.store = {
+      loadCompletedSessions: () => [],
+    };
+    service.bootstrapTrades = [];
+    service.liveTrades = [];
+    service.lastTradeAt = liveSession.lastTradeTimestamp;
+    service.lastAssetContextAt = null;
+
+    const result = await service.getSessionProfile();
+
+    expect(result.liveSession.sessionDate).toBe('2026-04-28');
+    expect(result.profile.state).toBeTruthy();
+    expect(result.profile.evidence.length).toBeGreaterThan(0);
   });
 });
