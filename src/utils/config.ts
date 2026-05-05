@@ -4,6 +4,8 @@ import { getSettingsPath } from './app-paths.js';
 
 // Map legacy model IDs to provider IDs for migration
 const MODEL_TO_PROVIDER_MAP: Record<string, string> = {
+  'gpt-5.5': 'openai',
+  'gpt-5.4': 'openai',
   'gpt-5.2': 'openai',
   'claude-sonnet-4-5': 'anthropic',
   'gemini-3': 'google',

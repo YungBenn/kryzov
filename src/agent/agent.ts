@@ -21,7 +21,7 @@ import {
 } from './answer-style.js';
 
 
-const DEFAULT_MODEL = 'gpt-5.2';
+const DEFAULT_MODEL = 'gpt-5.5';
 const DEFAULT_MAX_ITERATIONS = 10;
 
 /**
