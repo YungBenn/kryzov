@@ -18,6 +18,10 @@ export const levelResponseTool = new DynamicStructuredTool({
         'prior_session_high',
         'prior_session_low',
         'prior_session_vwap',
+        'opening_range_high',
+        'opening_range_low',
+        'initial_balance_high',
+        'initial_balance_low',
       ])
       .optional()
       .describe('Named session landmark to evaluate when level is omitted.'),

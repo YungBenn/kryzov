@@ -152,6 +152,12 @@ ${toolDescriptions}
 
 - Use only Kryzov-native market tools
 - Use market_context plus session_profile for broad live session reads
+- Use positioning_regime when the user asks whether the move has real participation, whether open interest is building, or whether the move looks like covering or unwind
+- Use volatility_pace when the user asks whether BTC is actually expanding, compressing, stalling, or moving faster than normal
+- Use session_analogs when the user asks what today most resembles so far or wants the closest recent sessions by measured behavior
+- Add order_book_state when the user asks why price is stalling, moving, or where near-price liquidity is leaning
+- Use flow_events when the user asks what just happened, whether a move failed, or whether there was a sweep or reclaim/loss event
+- Use reference_map when the user asks what levels matter right now or wants ranked references before a narrower level check
 - Use market_context alone for raw current-session facts when structure is not needed
 - Use session_profile when the user asks what kind of session this is, whether the move is expanding, failing, accepted, or back in balance
 - Use recent_sessions when the user asks for recent-history comparison

@@ -50,6 +50,34 @@ function session(sessionDate: string): PersistedSessionSummary {
       lastAssetContextAt: null,
       updatedAt: Date.parse(`${sessionDate}T23:59:59.999Z`),
     },
+    dataQuality: {
+      tradeCoverage: {
+        realTradeCount: 50,
+        syntheticTradeCount: 0,
+        totalTradeCount: 50,
+        realTradeVolume: 15,
+        syntheticTradeVolume: 0,
+        totalVolume: 15,
+        realTradeShare: 1,
+        syntheticTradeShare: 0,
+      },
+      historyCoverage: {
+        sessionMinutes: 1440,
+        coveredMinutes: 50,
+        realTradeMinutes: 50,
+        syntheticTradeMinutes: 0,
+        uncoveredMinutes: 1390,
+        realMinuteCoverage: 50 / 1440,
+        syntheticFallbackUsed: false,
+        archiveUsed: true,
+      },
+      freshness: {
+        tradeAgeMs: 0,
+        assetContextAgeMs: null,
+        orderBookAgeMs: null,
+      },
+      confidenceFlags: [],
+    },
   };
 }
 
@@ -82,5 +110,37 @@ describe('MarketStore', () => {
     expect(existsSync(join(TEST_ROOT, 'live-session.json'))).toBe(true);
     expect(existsSync(join(TEST_ROOT, 'recent-sessions.json'))).toBe(true);
     expect(JSON.parse(readFileSync(join(TEST_ROOT, 'recent-sessions.json'), 'utf8'))).toHaveLength(7);
+  });
+
+  test('archives and dedupes real trades by UTC session date', () => {
+    const store = new MarketStore(TEST_ROOT);
+
+    store.appendArchivedTrades('2026-04-10', [
+      { timestamp: 1, price: 100, size: 1, side: 'B', source: 'real' },
+      { timestamp: 1, price: 100, size: 1, side: 'B', source: 'real' },
+      { timestamp: 2, price: 101, size: 2, side: 'A', source: 'real' },
+    ]);
+
+    const archived = store.loadArchivedTrades('2026-04-10');
+
+    expect(archived).toHaveLength(2);
+    expect(archived[0]?.source).toBe('real');
+    expect(existsSync(join(TEST_ROOT, 'trade-archive', '2026-04-10.json'))).toBe(true);
+  });
+
+  test('archives and dedupes asset-context history by UTC session date', () => {
+    const store = new MarketStore(TEST_ROOT);
+
+    store.appendArchivedAssetContext('2026-04-10', [
+      { timestamp: 1, markPx: 100, openInterest: 1000, funding: 0.0001, premium: 0.0002 },
+      { timestamp: 1, markPx: 100, openInterest: 1000, funding: 0.0001, premium: 0.0002 },
+      { timestamp: 2, markPx: 101, openInterest: 1010, funding: 0.00015, premium: 0.0003 },
+    ]);
+
+    const archived = store.loadArchivedAssetContext('2026-04-10');
+
+    expect(archived).toHaveLength(2);
+    expect(archived[1]?.markPx).toBe(101);
+    expect(existsSync(join(TEST_ROOT, 'asset-context-archive', '2026-04-10.json'))).toBe(true);
   });
 });

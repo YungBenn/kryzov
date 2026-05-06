@@ -1,4 +1,10 @@
 export { marketContextTool } from './market-context.js';
 export { sessionProfileTool } from './session-profile.js';
+export { positioningRegimeTool } from './positioning-regime.js';
+export { volatilityPaceTool } from './volatility-pace.js';
+export { sessionAnalogsTool } from './session-analogs.js';
 export { recentSessionsTool } from './recent-sessions.js';
 export { levelResponseTool } from './level-response.js';
+export { orderBookStateTool } from './order-book-state.js';
+export { flowEventsTool } from './flow-events.js';
+export { referenceMapTool } from './reference-map.js';

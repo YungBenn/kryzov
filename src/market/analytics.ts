@@ -3,6 +3,7 @@ export interface MarketTrade {
   price: number;
   size: number;
   side: 'B' | 'A';
+  source?: 'real' | 'synthetic';
 }
 
 export interface AggressionMetrics {
@@ -100,6 +101,33 @@ interface SessionProfileParams {
   levelReferences?: Record<string, number | null>;
 }
 
+export interface ThirtyMinuteBracket {
+  index: number;
+  start: number;
+  end: number;
+  range: SessionRange;
+  vwap: number | null;
+  aggression: AggressionMetrics;
+  tradeCount: number;
+  totalVolume: number;
+  lastTradeTimestamp: number | null;
+}
+
+interface ThirtyMinuteProfileContext {
+  currentBracket: ThirtyMinuteBracket;
+  priorCompositeRange: SessionRange;
+  nonEmptyBracketCount: number;
+  currentBias: SessionBias;
+  priorBreakoutDirection: 'up' | 'down' | null;
+  brokeUp: boolean;
+  brokeDown: boolean;
+  acceptedUp: boolean;
+  acceptedDown: boolean;
+  failedUp: boolean;
+  failedDown: boolean;
+  regainedBalance: boolean;
+}
+
 const THIRTY_MINUTES_MS = 30 * 60 * 1000;
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 const STALE_TRADE_WINDOW_MS = 15 * 60 * 1000;
@@ -158,6 +186,20 @@ function computeRange(trades: MarketTrade[]): SessionRange {
   };
 }
 
+function combineRanges(ranges: SessionRange[]): SessionRange {
+  const open = ranges.find((range) => range.open !== null)?.open ?? null;
+  const last = [...ranges].reverse().find((range) => range.last !== null)?.last ?? null;
+  const highs = ranges.map((range) => range.high).filter((value): value is number => value !== null);
+  const lows = ranges.map((range) => range.low).filter((value): value is number => value !== null);
+
+  return {
+    open,
+    high: highs.length > 0 ? Math.max(...highs) : null,
+    low: lows.length > 0 ? Math.min(...lows) : null,
+    last,
+  };
+}
+
 export function computeSessionMetrics(params: {
   trades: MarketTrade[];
   now: number;
@@ -182,6 +224,36 @@ export function computeSessionMetrics(params: {
     totalVolume: sessionTrades.reduce((sum, trade) => sum + trade.size, 0),
     lastTradeTimestamp: sessionTrades[sessionTrades.length - 1]?.timestamp ?? null,
   };
+}
+
+export function buildThirtyMinuteBrackets(params: {
+  trades: MarketTrade[];
+  now: number;
+  sessionStart: number;
+}): ThirtyMinuteBracket[] {
+  const sessionTrades = sortTrades(
+    params.trades.filter((trade) => trade.timestamp >= params.sessionStart && trade.timestamp <= params.now),
+  );
+  const currentBracketIndex = Math.max(0, Math.floor((params.now - params.sessionStart) / THIRTY_MINUTES_MS));
+
+  return Array.from({ length: currentBracketIndex + 1 }, (_, index) => {
+    const start = params.sessionStart + index * THIRTY_MINUTES_MS;
+    const bracketTrades = sessionTrades.filter(
+      (trade) => trade.timestamp >= start && trade.timestamp < start + THIRTY_MINUTES_MS,
+    );
+
+    return {
+      index,
+      start,
+      end: Math.min(start + THIRTY_MINUTES_MS - 1, params.now),
+      range: computeRange(bracketTrades),
+      vwap: computeVwap(bracketTrades),
+      aggression: computeAggressionMetrics(bracketTrades),
+      tradeCount: bracketTrades.length,
+      totalVolume: bracketTrades.reduce((sum, trade) => sum + trade.size, 0),
+      lastTradeTimestamp: bracketTrades[bracketTrades.length - 1]?.timestamp ?? null,
+    };
+  });
 }
 
 function getRangePosition(range: SessionRange): number | null {
@@ -294,8 +366,11 @@ function buildEvidence(params: {
   recentAverageRange: number | null;
   currentRange: number | null;
   metrics: SessionMetrics;
+  periodContext: ThirtyMinuteProfileContext | null;
 }): string[] {
   const evidence: string[] = [];
+  const currentBracket = params.periodContext?.currentBracket;
+  const priorRange = params.periodContext?.priorCompositeRange ?? null;
 
   if (params.rangeLocation === 'high') {
     evidence.push('price is pressing the upper part of the session range');
@@ -313,7 +388,13 @@ function buildEvidence(params: {
     evidence.push('price is staying close to the session average');
   }
 
-  if (params.bias === 'buy') {
+  if (currentBracket && params.bias === 'buy') {
+    evidence.push('the latest 30m period still favors buyers');
+  } else if (currentBracket && params.bias === 'sell') {
+    evidence.push('the latest 30m period still favors sellers');
+  } else if (currentBracket) {
+    evidence.push('the latest 30m period is fairly balanced');
+  } else if (params.bias === 'buy') {
     evidence.push('recent flow still favors buyers');
   } else if (params.bias === 'sell') {
     evidence.push('recent flow still favors sellers');
@@ -330,7 +411,17 @@ function buildEvidence(params: {
     evidence.push('the range is already wider than the recent session average');
   }
 
-  if (params.state === 'accepted_up') {
+  if (currentBracket && priorRange !== null && priorRange.high !== null && params.state === 'accepted_up') {
+    evidence.push('the latest 30m period is holding above the earlier session high');
+  } else if (currentBracket && priorRange !== null && priorRange.low !== null && params.state === 'accepted_down') {
+    evidence.push('the latest 30m period is holding below the earlier session low');
+  } else if (currentBracket && priorRange !== null && priorRange.high !== null && params.state === 'failed_up') {
+    evidence.push('the latest 30m period probed above the earlier high and fell back in');
+  } else if (currentBracket && priorRange !== null && priorRange.low !== null && params.state === 'failed_down') {
+    evidence.push('the latest 30m period probed below the earlier low and came back in');
+  } else if (currentBracket && params.state === 'regained_balance') {
+    evidence.push('the latest 30m period has rotated back toward the session middle');
+  } else if (params.state === 'accepted_up') {
     evidence.push('the upside push is still holding near session highs');
   } else if (params.state === 'accepted_down') {
     evidence.push('the downside push is still holding near session lows');
@@ -389,7 +480,98 @@ function buildTransition(state: SessionState): SessionTransition | null {
   return null;
 }
 
-function classifySessionState(params: {
+function buildThirtyMinuteProfileContext(params: {
+  brackets: ThirtyMinuteBracket[];
+  metrics: SessionMetrics;
+}): ThirtyMinuteProfileContext | null {
+  const nonEmptyBrackets = params.brackets.filter((bracket) => bracket.tradeCount > 0);
+  const currentBracket = nonEmptyBrackets[nonEmptyBrackets.length - 1];
+
+  if (!currentBracket) {
+    return null;
+  }
+
+  const priorBrackets = nonEmptyBrackets.filter((bracket) => bracket.index < currentBracket.index);
+  const priorCompositeRange = combineRanges(priorBrackets.map((bracket) => bracket.range));
+  const currentBias = classifySessionBias(currentBracket.aggression);
+  const priorHigh = priorCompositeRange.high;
+  const priorLow = priorCompositeRange.low;
+  const currentHigh = currentBracket.range.high;
+  const currentLow = currentBracket.range.low;
+  const currentLast = currentBracket.range.last;
+  const currentVwap = currentBracket.vwap ?? currentLast;
+  const toleranceBase = getRangeSize(priorCompositeRange) ?? getRangeSize(params.metrics.range) ?? 0;
+  const tolerance = Math.max(toleranceBase * 0.05, (params.metrics.sessionVwap ?? currentLast ?? 0) * 0.0004);
+  const brokeUp = priorHigh !== null && currentHigh !== null && currentHigh > priorHigh;
+  const brokeDown = priorLow !== null && currentLow !== null && currentLow < priorLow;
+  const acceptedUp =
+    brokeUp &&
+    priorHigh !== null &&
+    currentLast !== null &&
+    currentVwap !== null &&
+    currentLast >= priorHigh - tolerance &&
+    currentVwap >= priorHigh - tolerance &&
+    currentBias === 'buy';
+  const acceptedDown =
+    brokeDown &&
+    priorLow !== null &&
+    currentLast !== null &&
+    currentVwap !== null &&
+    currentLast <= priorLow + tolerance &&
+    currentVwap <= priorLow + tolerance &&
+    currentBias === 'sell';
+  const failedUp =
+    brokeUp &&
+    priorHigh !== null &&
+    currentLast !== null &&
+    currentLast < priorHigh - tolerance &&
+    currentBias !== 'buy';
+  const failedDown =
+    brokeDown &&
+    priorLow !== null &&
+    currentLast !== null &&
+    currentLast > priorLow + tolerance &&
+    currentBias !== 'sell';
+  let priorBreakoutDirection: 'up' | 'down' | null = null;
+
+  for (let index = 1; index < nonEmptyBrackets.length; index++) {
+    const bracket = nonEmptyBrackets[index];
+    const earlierRange = combineRanges(nonEmptyBrackets.slice(0, index).map((entry) => entry.range));
+    if (earlierRange.high !== null && bracket?.range.high !== null && bracket.range.high > earlierRange.high) {
+      priorBreakoutDirection = 'up';
+    }
+    if (earlierRange.low !== null && bracket?.range.low !== null && bracket.range.low < earlierRange.low) {
+      priorBreakoutDirection = 'down';
+    }
+  }
+
+  const regainedBalance =
+    nonEmptyBrackets.length >= 3 &&
+    priorBreakoutDirection !== null &&
+    !brokeUp &&
+    !brokeDown &&
+    currentBias === 'balanced' &&
+    params.metrics.sessionVwap !== null &&
+    currentLast !== null &&
+    Math.abs(currentLast - params.metrics.sessionVwap) <= Math.max(toleranceBase * 0.2, params.metrics.sessionVwap * 0.0007);
+
+  return {
+    currentBracket,
+    priorCompositeRange,
+    nonEmptyBracketCount: nonEmptyBrackets.length,
+    currentBias,
+    priorBreakoutDirection,
+    brokeUp,
+    brokeDown,
+    acceptedUp,
+    acceptedDown,
+    failedUp,
+    failedDown,
+    regainedBalance,
+  };
+}
+
+function classifyAggregateSessionState(params: {
   metrics: SessionMetrics;
   bias: SessionBias;
   rangePosition: number | null;
@@ -449,13 +631,68 @@ function classifySessionState(params: {
   return 'balanced';
 }
 
-function classifyConfidence(params: SessionProfileParams, state: SessionState): SessionConfidence {
+function classifySessionStateFromBrackets(params: {
+  periodContext: ThirtyMinuteProfileContext;
+  rangePosition: number | null;
+  vwapRelation: SessionVwapRelation;
+}): SessionState {
+  const { periodContext, rangePosition, vwapRelation } = params;
+
+  if (periodContext.acceptedUp) {
+    return 'accepted_up';
+  }
+
+  if (periodContext.acceptedDown) {
+    return 'accepted_down';
+  }
+
+  if (periodContext.failedUp) {
+    return 'failed_up';
+  }
+
+  if (periodContext.failedDown) {
+    return 'failed_down';
+  }
+
+  if (periodContext.regainedBalance) {
+    return 'regained_balance';
+  }
+
+  if (
+    periodContext.brokeUp &&
+    periodContext.currentBias === 'buy' &&
+    rangePosition !== null &&
+    rangePosition >= 0.67 &&
+    vwapRelation !== 'below'
+  ) {
+    return 'expanding_up';
+  }
+
+  if (
+    periodContext.brokeDown &&
+    periodContext.currentBias === 'sell' &&
+    rangePosition !== null &&
+    rangePosition <= 0.33 &&
+    vwapRelation !== 'above'
+  ) {
+    return 'expanding_down';
+  }
+
+  return 'balanced';
+}
+
+function classifyConfidence(
+  params: SessionProfileParams,
+  state: SessionState,
+  periodContext: ThirtyMinuteProfileContext | null,
+): SessionConfidence {
   const stale =
     params.freshness.lastTradeAt === null ||
     params.now - params.freshness.lastTradeAt > STALE_TRADE_WINDOW_MS;
   const thin = params.metrics.tradeCount < 3 || params.metrics.totalVolume <= 0;
+  const thinStructure = periodContext !== null && periodContext.nonEmptyBracketCount < 2;
 
-  if (stale || thin) {
+  if (stale || thin || thinStructure) {
     return 'low';
   }
 
@@ -471,7 +708,7 @@ function classifyConfidence(params: SessionProfileParams, state: SessionState): 
   return 'medium';
 }
 
-function buildCaveat(params: SessionProfileParams): string | null {
+function buildCaveat(params: SessionProfileParams, periodContext: ThirtyMinuteProfileContext | null): string | null {
   if (params.freshness.lastTradeAt === null) {
     return 'Live trade flow is still thin.';
   }
@@ -482,6 +719,10 @@ function buildCaveat(params: SessionProfileParams): string | null {
 
   if (params.metrics.tradeCount < 3) {
     return 'There is not much session evidence yet.';
+  }
+
+  if (periodContext !== null && periodContext.nonEmptyBracketCount < 2) {
+    return 'The session has not printed enough 30m structure yet.';
   }
 
   return null;
@@ -663,17 +904,32 @@ export function deriveInterpretiveRead(metrics: SessionMetrics): InterpretiveRea
 export function deriveSessionProfile(params: SessionProfileParams): SessionProfile {
   const rangePosition = getRangePosition(params.metrics.range);
   const rangeLocation = classifyRangeLocation(rangePosition);
-  const rawBias = classifySessionBias(params.metrics.sessionAggression);
   const vwapRelation = classifyVwapRelation(params.metrics);
-  const state = classifySessionState({
-    metrics: params.metrics,
-    bias: rawBias,
-    rangePosition,
-    rangeLocation,
-    vwapRelation,
+  const brackets = buildThirtyMinuteBrackets({
+    trades: params.trades ?? [],
+    now: params.now,
+    sessionStart: params.metrics.sessionStart,
   });
+  const periodContext = buildThirtyMinuteProfileContext({
+    brackets,
+    metrics: params.metrics,
+  });
+  const rawBias = periodContext?.currentBias ?? classifySessionBias(params.metrics.sessionAggression);
+  const state = periodContext
+    ? classifySessionStateFromBrackets({
+        periodContext,
+        rangePosition,
+        vwapRelation,
+      })
+    : classifyAggregateSessionState({
+        metrics: params.metrics,
+        bias: rawBias,
+        rangePosition,
+        rangeLocation,
+        vwapRelation,
+      });
   const bias = normalizeBiasForState(state, rawBias);
-  const confidence = classifyConfidence(params, state);
+  const confidence = classifyConfidence(params, state, periodContext);
   const recentAverageRange = getRecentAverageRange(params);
   const currentRange = getRangeSize(params.metrics.range);
 
@@ -692,7 +948,8 @@ export function deriveSessionProfile(params: SessionProfileParams): SessionProfi
       recentAverageRange,
       currentRange,
       metrics: params.metrics,
+      periodContext,
     }),
-    caveat: buildCaveat(params),
+    caveat: buildCaveat(params, periodContext),
   };
 }

@@ -11,8 +11,31 @@ import {
   type SessionMetrics,
 } from './analytics.js';
 import {
+  derivePositioningRegime,
+  extractSessionFeatureVector,
+  rankSessionAnalogs,
+  deriveVolatilityPace,
+  type PositioningRegime,
+  type SessionAnalogMatch,
+  type SessionFeatureVector,
+  type VolatilityPace,
+} from './contextual.js';
+import {
+  buildReferenceMap,
+  deriveIntradayReferences,
+  deriveOrderBookState,
+  detectFlowEvents,
+  type FlowEvent,
+  type OrderBookLevel,
+  type OrderBookSnapshot,
+  type OrderBookState,
+  type RankedReference,
+} from './microstructure.js';
+import {
   MarketStore,
   type MarketAssetContext,
+  type MarketAssetContextPoint,
+  type MarketDataQuality,
   type MarketFreshness,
   type PersistedSessionSummary,
 } from './store.js';
@@ -20,12 +43,24 @@ import {
 const BTC_COIN = 'BTC';
 const DEFAULT_WS_URL = 'wss://api.hyperliquid.xyz/ws';
 const DEFAULT_INFO_URL = 'https://api.hyperliquid.xyz/info';
+const ONE_MINUTE_MS = 60 * 1000;
+const STALE_TRADE_WINDOW_MS = 15 * 60 * 1000;
+const STALE_BOOK_WINDOW_MS = 5 * 60 * 1000;
 
 interface HyperliquidTradeMessage {
   px?: string | number;
   sz?: string | number;
   side?: string;
   time?: number;
+}
+
+interface HyperliquidBookLevelMessage {
+  px?: string | number;
+  sz?: string | number;
+  n?: string | number;
+  price?: string | number;
+  size?: string | number;
+  count?: string | number;
 }
 
 interface HyperliquidCandle {
@@ -77,6 +112,73 @@ export interface SessionProfileSnapshot {
   };
 }
 
+export interface OrderBookStateSnapshot {
+  book: OrderBookState | null;
+  liveSession: PersistedSessionSummary;
+  levelReferences: Record<string, number | null>;
+  freshness: {
+    lastOrderBookAt: number | null;
+    updatedAt: number;
+  };
+  connection: {
+    wsConnected: boolean;
+    bootstrapOnly: boolean;
+  };
+}
+
+export interface FlowEventsSnapshot {
+  events: FlowEvent[];
+  liveSession: PersistedSessionSummary;
+  orderBook: OrderBookState | null;
+  levelReferences: Record<string, number | null>;
+  connection: {
+    wsConnected: boolean;
+    bootstrapOnly: boolean;
+  };
+}
+
+export interface ReferenceMapSnapshot {
+  currentPrice: number | null;
+  references: RankedReference[];
+  liveSession: PersistedSessionSummary;
+  levelReferences: Record<string, number | null>;
+  connection: {
+    wsConnected: boolean;
+    bootstrapOnly: boolean;
+  };
+}
+
+export interface PositioningRegimeSnapshot {
+  regime: PositioningRegime;
+  liveSession: PersistedSessionSummary;
+  assetContextHistoryPoints: number;
+  connection: {
+    wsConnected: boolean;
+    bootstrapOnly: boolean;
+  };
+}
+
+export interface VolatilityPaceSnapshot {
+  pace: VolatilityPace;
+  liveSession: PersistedSessionSummary;
+  comparison: MarketComparison;
+  connection: {
+    wsConnected: boolean;
+    bootstrapOnly: boolean;
+  };
+}
+
+export interface SessionAnalogsSnapshot {
+  liveVector: SessionFeatureVector;
+  analogs: SessionAnalogMatch[];
+  liveSession: PersistedSessionSummary;
+  comparison: MarketComparison;
+  connection: {
+    wsConnected: boolean;
+    bootstrapOnly: boolean;
+  };
+}
+
 function toNumber(value: unknown): number | null {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value;
@@ -90,6 +192,145 @@ function toNumber(value: unknown): number | null {
 
 function formatSessionDate(timestamp: number): string {
   return new Date(timestamp).toISOString().slice(0, 10);
+}
+
+function sortTrades(trades: MarketTrade[]): MarketTrade[] {
+  return [...trades].sort((left, right) => left.timestamp - right.timestamp);
+}
+
+function dedupeTrades(trades: MarketTrade[]): MarketTrade[] {
+  const byKey = new Map<string, MarketTrade>();
+
+  for (const trade of sortTrades(trades)) {
+    const key = `${trade.timestamp}:${trade.price}:${trade.size}:${trade.side}`;
+    const existing = byKey.get(key);
+    if (existing?.source === 'real') {
+      continue;
+    }
+    byKey.set(key, trade);
+  }
+
+  return [...byKey.values()].sort((left, right) => left.timestamp - right.timestamp);
+}
+
+function getMinuteBucket(timestamp: number): number {
+  return Math.floor(timestamp / ONE_MINUTE_MS);
+}
+
+function mergeSessionTrades(params: {
+  archivedTrades: MarketTrade[];
+  syntheticTrades: MarketTrade[];
+  liveTrades?: MarketTrade[];
+}): MarketTrade[] {
+  const realTrades = dedupeTrades([...(params.archivedTrades ?? []), ...(params.liveTrades ?? [])]).map((trade) => ({
+    ...trade,
+    source: 'real' as const,
+  }));
+  const realMinuteBuckets = new Set(realTrades.map((trade) => getMinuteBucket(trade.timestamp)));
+  const syntheticFallback = (params.syntheticTrades ?? [])
+    .filter((trade) => !realMinuteBuckets.has(getMinuteBucket(trade.timestamp)))
+    .map((trade) => ({
+      ...trade,
+      source: 'synthetic' as const,
+    }));
+
+  return dedupeTrades([...realTrades, ...syntheticFallback]);
+}
+
+function inferSummarySource(trades: MarketTrade[]): PersistedSessionSummary['source'] {
+  const realTrades = trades.filter((trade) => trade.source !== 'synthetic').length;
+  const syntheticTrades = trades.filter((trade) => trade.source === 'synthetic').length;
+
+  if (realTrades > 0 && syntheticTrades > 0) {
+    return 'mixed';
+  }
+
+  if (realTrades > 0) {
+    return 'archive';
+  }
+
+  return 'bootstrap';
+}
+
+function computeDataQuality(params: {
+  trades: MarketTrade[];
+  sessionStart: number;
+  now: number;
+  freshness: MarketFreshness;
+  lastOrderBookAt?: number | null;
+  archiveUsed: boolean;
+  hasArchiveHistory?: boolean;
+  includeLiveFreshnessFlags?: boolean;
+}): MarketDataQuality {
+  const realTrades = params.trades.filter((trade) => trade.source !== 'synthetic');
+  const syntheticTrades = params.trades.filter((trade) => trade.source === 'synthetic');
+  const realTradeVolume = realTrades.reduce((sum, trade) => sum + trade.size, 0);
+  const syntheticTradeVolume = syntheticTrades.reduce((sum, trade) => sum + trade.size, 0);
+  const totalVolume = realTradeVolume + syntheticTradeVolume;
+  const totalTradeCount = params.trades.length;
+  const sessionMinutes = Math.max(1, Math.ceil((params.now - params.sessionStart) / ONE_MINUTE_MS));
+  const realTradeMinutes = new Set(realTrades.map((trade) => getMinuteBucket(trade.timestamp))).size;
+  const syntheticTradeMinutes = new Set(syntheticTrades.map((trade) => getMinuteBucket(trade.timestamp))).size;
+  const coveredMinutes = new Set(params.trades.map((trade) => getMinuteBucket(trade.timestamp))).size;
+  const uncoveredMinutes = Math.max(0, sessionMinutes - coveredMinutes);
+  const tradeAgeMs =
+    params.freshness.lastTradeAt !== null ? Math.max(0, params.now - params.freshness.lastTradeAt) : null;
+  const assetContextAgeMs =
+    params.freshness.lastAssetContextAt !== null
+      ? Math.max(0, params.now - params.freshness.lastAssetContextAt)
+      : null;
+  const orderBookAgeMs =
+    params.lastOrderBookAt !== undefined && params.lastOrderBookAt !== null
+      ? Math.max(0, params.now - params.lastOrderBookAt)
+      : null;
+  const confidenceFlags: MarketDataQuality['confidenceFlags'] = [];
+
+  if (realTrades.length < 20) {
+    confidenceFlags.push('thin_real_flow');
+  }
+  if (syntheticTrades.length > 0) {
+    confidenceFlags.push(realTrades.length === 0 ? 'bootstrap_only' : 'synthetic_fallback');
+  }
+  if (params.includeLiveFreshnessFlags !== false) {
+    if (tradeAgeMs === null || tradeAgeMs > STALE_TRADE_WINDOW_MS) {
+      confidenceFlags.push('stale_trades');
+    }
+    if (orderBookAgeMs === null || orderBookAgeMs > STALE_BOOK_WINDOW_MS) {
+      confidenceFlags.push('stale_book');
+    }
+  }
+  if (params.hasArchiveHistory === false) {
+    confidenceFlags.push('no_archive_history');
+  }
+
+  return {
+    tradeCoverage: {
+      realTradeCount: realTrades.length,
+      syntheticTradeCount: syntheticTrades.length,
+      totalTradeCount,
+      realTradeVolume,
+      syntheticTradeVolume,
+      totalVolume,
+      realTradeShare: totalTradeCount > 0 ? realTrades.length / totalTradeCount : 0,
+      syntheticTradeShare: totalTradeCount > 0 ? syntheticTrades.length / totalTradeCount : 0,
+    },
+    historyCoverage: {
+      sessionMinutes,
+      coveredMinutes,
+      realTradeMinutes,
+      syntheticTradeMinutes,
+      uncoveredMinutes,
+      realMinuteCoverage: sessionMinutes > 0 ? realTradeMinutes / sessionMinutes : 0,
+      syntheticFallbackUsed: syntheticTrades.length > 0,
+      archiveUsed: params.archiveUsed,
+    },
+    freshness: {
+      tradeAgeMs,
+      assetContextAgeMs,
+      orderBookAgeMs,
+    },
+    confidenceFlags,
+  };
 }
 
 function buildEmptySummary(sessionStart: number, assetContext: MarketAssetContext | null): PersistedSessionSummary {
@@ -132,14 +373,28 @@ function buildEmptySummary(sessionStart: number, assetContext: MarketAssetContex
       lastAssetContextAt: null,
       updatedAt: now,
     },
+    dataQuality: computeDataQuality({
+      trades: [],
+      sessionStart,
+      now,
+      freshness: {
+        lastTradeAt: null,
+        lastAssetContextAt: null,
+        updatedAt: now,
+      },
+      lastOrderBookAt: null,
+      archiveUsed: false,
+      hasArchiveHistory: false,
+    }),
   };
 }
 
 function buildSummaryFromMetrics(params: {
   metrics: SessionMetrics;
-  source: 'stream' | 'bootstrap';
+  source: PersistedSessionSummary['source'];
   assetContext: MarketAssetContext | null;
   freshness: MarketFreshness;
+  dataQuality: MarketDataQuality;
 }): PersistedSessionSummary {
   const sessionDate = formatSessionDate(params.metrics.sessionStart);
 
@@ -161,6 +416,7 @@ function buildSummaryFromMetrics(params: {
     interpretiveRead: deriveInterpretiveRead(params.metrics),
     assetContext: params.assetContext,
     freshness: params.freshness,
+    dataQuality: params.dataQuality,
   };
 }
 
@@ -174,6 +430,7 @@ function buildSyntheticTradesFromCandles(candles: HyperliquidCandle[]): MarketTr
       price: close,
       size: volume,
       side: close >= open ? 'B' : 'A',
+      source: 'synthetic',
     };
   });
 }
@@ -188,7 +445,7 @@ function normalizeTrade(message: HyperliquidTradeMessage): MarketTrade | null {
     return null;
   }
 
-  return { price, size, timestamp, side };
+  return { price, size, timestamp, side, source: 'real' };
 }
 
 function normalizeAssetContext(raw: unknown): MarketAssetContext | null {
@@ -209,6 +466,106 @@ function normalizeAssetContext(raw: unknown): MarketAssetContext | null {
     openInterest: toNumber(source.openInterest),
     dayNtlVlm: toNumber(source.dayNtlVlm),
     premium: toNumber(source.premium),
+  };
+}
+
+function toAssetContextPoint(
+  assetContext: MarketAssetContext,
+  timestamp: number,
+): MarketAssetContextPoint {
+  return {
+    timestamp,
+    markPx: typeof assetContext.markPx === 'number' ? assetContext.markPx : null,
+    oraclePx: typeof assetContext.oraclePx === 'number' ? assetContext.oraclePx : null,
+    funding: typeof assetContext.funding === 'number' ? assetContext.funding : null,
+    openInterest: typeof assetContext.openInterest === 'number' ? assetContext.openInterest : null,
+    dayNtlVlm: typeof assetContext.dayNtlVlm === 'number' ? assetContext.dayNtlVlm : null,
+    premium: typeof assetContext.premium === 'number' ? assetContext.premium : null,
+  };
+}
+
+function normalizeBookLevel(raw: unknown): OrderBookLevel | null {
+  if (Array.isArray(raw)) {
+    const price = toNumber(raw[0]);
+    const size = toNumber(raw[1]);
+    const count = toNumber(raw[2]);
+
+    if (price === null || size === null) {
+      return null;
+    }
+
+    return {
+      price,
+      size,
+      count,
+    };
+  }
+
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+
+  const message = raw as HyperliquidBookLevelMessage;
+  const price = toNumber(message.px ?? message.price);
+  const size = toNumber(message.sz ?? message.size);
+  const count = toNumber(message.n ?? message.count);
+
+  if (price === null || size === null) {
+    return null;
+  }
+
+  return {
+    price,
+    size,
+    count,
+  };
+}
+
+function normalizeOrderBook(raw: unknown): OrderBookSnapshot | null {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+
+  const source = raw as Record<string, unknown>;
+  const levels =
+    Array.isArray(source.levels) && source.levels.length >= 2
+      ? source.levels
+      : Array.isArray(source.book) && source.book.length >= 2
+        ? source.book
+        : null;
+  const bidsRaw = Array.isArray(source.bids)
+    ? source.bids
+    : levels && Array.isArray(levels[0])
+      ? (levels[0] as unknown[])
+      : null;
+  const asksRaw = Array.isArray(source.asks)
+    ? source.asks
+    : levels && Array.isArray(levels[1])
+      ? (levels[1] as unknown[])
+      : null;
+
+  if (!bidsRaw || !asksRaw) {
+    return null;
+  }
+
+  const bids = bidsRaw
+    .map(normalizeBookLevel)
+    .filter((level): level is OrderBookLevel => level !== null)
+    .sort((left, right) => right.price - left.price);
+  const asks = asksRaw
+    .map(normalizeBookLevel)
+    .filter((level): level is OrderBookLevel => level !== null)
+    .sort((left, right) => left.price - right.price);
+  const timestamp = toNumber(source.time) ?? toNumber(source.ts) ?? Date.now();
+
+  if (bids.length === 0 || asks.length === 0) {
+    return null;
+  }
+
+  return {
+    bids,
+    asks,
+    timestamp,
   };
 }
 
@@ -381,8 +738,16 @@ export function buildPlainComparisonSummary(comparison: MarketComparison): Plain
 function getLevelReferences(
   liveSession: PersistedSessionSummary,
   recentSessions: PersistedSessionSummary[],
+  trades: MarketTrade[],
+  now: number,
 ): Record<string, number | null> {
   const previousSession = recentSessions[recentSessions.length - 1] ?? null;
+  const intradayReferences = deriveIntradayReferences({
+    trades,
+    sessionStart: liveSession.sessionStart,
+    now,
+  });
+
   return {
     session_open: liveSession.range.open,
     session_high: liveSession.range.high,
@@ -391,6 +756,7 @@ function getLevelReferences(
     prior_session_high: previousSession?.range.high ?? null,
     prior_session_low: previousSession?.range.low ?? null,
     prior_session_vwap: previousSession?.sessionVwap ?? null,
+    ...intradayReferences,
   };
 }
 
@@ -409,8 +775,11 @@ export class MarketStateService {
   private readonly infoUrl = process.env.HYPERLIQUID_INFO_URL ?? DEFAULT_INFO_URL;
   private bootstrapTrades: MarketTrade[] = [];
   private liveTrades: MarketTrade[] = [];
+  private currentOrderBook: OrderBookSnapshot | null = null;
+  private previousOrderBook: OrderBookSnapshot | null = null;
   private currentAssetContext: MarketAssetContext | null = null;
   private lastTradeAt: number | null = null;
+  private lastOrderBookAt: number | null = null;
   private lastAssetContextAt: number | null = null;
   private started = false;
   private starting: Promise<void> | null = null;
@@ -436,10 +805,11 @@ export class MarketStateService {
     await this.ensureStarted();
     const liveSession = await this.buildLiveSessionSnapshot();
     const recentSessions = this.store.loadCompletedSessions();
+    const trades = [...this.bootstrapTrades, ...this.liveTrades];
     return {
       ...liveSession,
       comparison: computeComparison(liveSession, recentSessions),
-      levelReferences: getLevelReferences(liveSession, recentSessions),
+      levelReferences: getLevelReferences(liveSession, recentSessions, trades, Date.now()),
       connection: {
         wsConnected: this.wsConnected,
         bootstrapOnly: this.liveTrades.length === 0,
@@ -469,8 +839,8 @@ export class MarketStateService {
     await this.ensureStarted();
     const liveSession = await this.buildLiveSessionSnapshot();
     const recentSessions = this.store.loadCompletedSessions();
-    const levelReferences = getLevelReferences(liveSession, recentSessions);
     const trades = [...this.bootstrapTrades, ...this.liveTrades];
+    const levelReferences = getLevelReferences(liveSession, recentSessions, trades, Date.now());
 
     return {
       profile: deriveSessionProfile({
@@ -502,6 +872,193 @@ export class MarketStateService {
     };
   }
 
+  async getOrderBookState(): Promise<OrderBookStateSnapshot> {
+    await this.ensureStarted();
+    const liveSession = await this.buildLiveSessionSnapshot();
+    const recentSessions = this.store.loadCompletedSessions();
+    const trades = [...this.bootstrapTrades, ...this.liveTrades];
+
+    return {
+      book: this.currentOrderBook
+        ? deriveOrderBookState({
+            book: this.currentOrderBook,
+            previousBook: this.previousOrderBook,
+          })
+        : null,
+      liveSession,
+      levelReferences: getLevelReferences(liveSession, recentSessions, trades, Date.now()),
+      freshness: {
+        lastOrderBookAt: this.lastOrderBookAt,
+        updatedAt: Date.now(),
+      },
+      connection: {
+        wsConnected: this.wsConnected,
+        bootstrapOnly: this.liveTrades.length === 0,
+      },
+    };
+  }
+
+  async getFlowEvents(limit = 5): Promise<FlowEventsSnapshot> {
+    await this.ensureStarted();
+    const liveSession = await this.buildLiveSessionSnapshot();
+    const recentSessions = this.store.loadCompletedSessions();
+    const trades = [...this.bootstrapTrades, ...this.liveTrades];
+    const now = Date.now();
+    const levelReferences = getLevelReferences(liveSession, recentSessions, trades, now);
+    const orderBook = this.currentOrderBook
+      ? deriveOrderBookState({
+          book: this.currentOrderBook,
+          previousBook: this.previousOrderBook,
+        })
+      : null;
+
+    return {
+      events: detectFlowEvents({
+        trades,
+        now,
+        metrics: {
+          sessionStart: liveSession.sessionStart,
+          now: liveSession.sessionEnd,
+          sessionVwap: liveSession.sessionVwap,
+          rolling30mVwap: liveSession.rolling30mVwap,
+          cumulativeDelta: liveSession.cumulativeDelta,
+          sessionAggression: liveSession.sessionAggression,
+          trailing5mAggression: liveSession.trailing5mAggression,
+          range: liveSession.range,
+          tradeCount: liveSession.tradeCount,
+          totalVolume: liveSession.totalVolume,
+          lastTradeTimestamp: liveSession.lastTradeTimestamp,
+        },
+        orderBookState: orderBook,
+        levelReferences,
+      }).slice(0, limit),
+      liveSession,
+      orderBook,
+      levelReferences,
+      connection: {
+        wsConnected: this.wsConnected,
+        bootstrapOnly: this.liveTrades.length === 0,
+      },
+    };
+  }
+
+  async getReferenceMap(limit = 8): Promise<ReferenceMapSnapshot> {
+    await this.ensureStarted();
+    const liveSession = await this.buildLiveSessionSnapshot();
+    const recentSessions = this.store.loadCompletedSessions();
+    const trades = [...this.bootstrapTrades, ...this.liveTrades];
+    const levelReferences = getLevelReferences(liveSession, recentSessions, trades, Date.now());
+
+    return {
+      currentPrice: liveSession.range.last,
+      references: buildReferenceMap({
+        trades,
+        now: Date.now(),
+        currentPrice: liveSession.range.last,
+        references: levelReferences,
+        limit,
+      }),
+      liveSession,
+      levelReferences,
+      connection: {
+        wsConnected: this.wsConnected,
+        bootstrapOnly: this.liveTrades.length === 0,
+      },
+    };
+  }
+
+  async getPositioningRegime(): Promise<PositioningRegimeSnapshot> {
+    await this.ensureStarted();
+    const now = Date.now();
+    const liveSession = await this.buildLiveSessionSnapshot();
+    const assetContextHistory = this.loadCurrentSessionAssetContextHistory(now);
+
+    return {
+      regime: derivePositioningRegime({
+        assetContextHistory,
+        now,
+        sessionStart: liveSession.sessionStart,
+      }),
+      liveSession,
+      assetContextHistoryPoints: assetContextHistory.length,
+      connection: {
+        wsConnected: this.wsConnected,
+        bootstrapOnly: this.liveTrades.length === 0,
+      },
+    };
+  }
+
+  async getVolatilityPace(): Promise<VolatilityPaceSnapshot> {
+    await this.ensureStarted();
+    const now = Date.now();
+    const liveSession = await this.buildLiveSessionSnapshot();
+    const recentSessions = this.store.loadCompletedSessions();
+    const trades = dedupeTrades([...this.bootstrapTrades, ...this.liveTrades]);
+
+    return {
+      pace: deriveVolatilityPace({
+        liveSession,
+        recentSessions,
+        trades,
+        now,
+      }),
+      liveSession,
+      comparison: computeComparison(liveSession, recentSessions),
+      connection: {
+        wsConnected: this.wsConnected,
+        bootstrapOnly: this.liveTrades.length === 0,
+      },
+    };
+  }
+
+  async getSessionAnalogs(limit = 3): Promise<SessionAnalogsSnapshot> {
+    await this.ensureStarted();
+    const now = Date.now();
+    const liveSession = await this.buildLiveSessionSnapshot();
+    const completedSessions = this.store.loadCompletedSessions();
+    const liveTrades = dedupeTrades([...this.bootstrapTrades, ...this.liveTrades]);
+    const liveAssetContextHistory = this.loadCurrentSessionAssetContextHistory(now);
+    const liveVector = extractSessionFeatureVector({
+      session: liveSession,
+      trades: liveTrades,
+      assetContextHistory: liveAssetContextHistory,
+      baselineSessions: completedSessions,
+      now,
+    });
+
+    const historicalVectors = completedSessions.map((session, index, sessions) => {
+      const sessionTrades = this.store.loadArchivedTrades(session.sessionDate).map((trade) => ({
+        ...trade,
+        source: 'real' as const,
+      }));
+      const assetContextHistory = this.store.loadArchivedAssetContext(session.sessionDate);
+      const baselineSessions = sessions.slice(Math.max(0, index - 3), index);
+
+      return extractSessionFeatureVector({
+        session,
+        trades: sessionTrades,
+        assetContextHistory,
+        baselineSessions,
+        now: session.sessionEnd,
+      });
+    });
+
+    return {
+      liveVector,
+      analogs: rankSessionAnalogs({
+        liveVector,
+        historicalVectors,
+        limit,
+      }),
+      liveSession,
+      comparison: computeComparison(liveSession, completedSessions),
+      connection: {
+        wsConnected: this.wsConnected,
+        bootstrapOnly: this.liveTrades.length === 0,
+      },
+    };
+  }
+
   async getLevelResponse(params: { level?: number; reference?: string }): Promise<{
     reference: string;
     level: number | null;
@@ -511,7 +1068,8 @@ export class MarketStateService {
     await this.ensureStarted();
     const liveSession = await this.buildLiveSessionSnapshot();
     const recentSessions = this.store.loadCompletedSessions();
-    const references = getLevelReferences(liveSession, recentSessions);
+    const trades = [...this.bootstrapTrades, ...this.liveTrades];
+    const references = getLevelReferences(liveSession, recentSessions, trades, Date.now());
     const reference = params.reference ?? 'session_vwap';
     const level = params.level ?? references[reference] ?? null;
     if (level === null) {
@@ -528,8 +1086,6 @@ export class MarketStateService {
         liveSession,
       };
     }
-
-    const trades = [...this.bootstrapTrades, ...this.liveTrades];
     return {
       reference,
       level,
@@ -561,8 +1117,23 @@ export class MarketStateService {
 
     this.currentAssetContext = await this.fetchCurrentAssetContext().catch(() => storedLive?.assetContext ?? null);
     this.lastAssetContextAt = this.currentAssetContext ? now : storedLive?.freshness.lastAssetContextAt ?? null;
-
-    this.bootstrapTrades = await this.fetchCurrentSessionBootstrapTrades(sessionStart).catch(() => []);
+    if (this.currentAssetContext) {
+      this.store.appendArchivedAssetContext(currentSessionDate, [
+        toAssetContextPoint(this.currentAssetContext, now),
+      ]);
+    }
+    this.currentOrderBook = await this.fetchCurrentOrderBook().catch(() => null);
+    this.previousOrderBook = null;
+    this.lastOrderBookAt = this.currentOrderBook?.timestamp ?? (this.currentOrderBook ? now : null);
+    const archivedTrades = this.store.loadArchivedTrades(currentSessionDate).map((trade) => ({
+      ...trade,
+      source: 'real' as const,
+    }));
+    const syntheticTrades = await this.fetchCurrentSessionBootstrapTrades(sessionStart).catch(() => []);
+    this.bootstrapTrades = mergeSessionTrades({
+      archivedTrades,
+      syntheticTrades,
+    });
     this.liveTrades = [];
 
     if (this.store.loadCompletedSessions().length === 0) {
@@ -587,6 +1158,7 @@ export class MarketStateService {
       this.wsConnected = true;
       this.reconnectDelayMs = 1_000;
       this.ws?.send(JSON.stringify({ method: 'subscribe', subscription: { type: 'trades', coin: BTC_COIN } }));
+      this.ws?.send(JSON.stringify({ method: 'subscribe', subscription: { type: 'l2Book', coin: BTC_COIN } }));
       this.ws?.send(
         JSON.stringify({ method: 'subscribe', subscription: { type: 'activeAssetCtx', coin: BTC_COIN } }),
       );
@@ -626,6 +1198,7 @@ export class MarketStateService {
 
     const channel = parsed.channel;
     if (channel === 'trades' && Array.isArray(parsed.data)) {
+      const tradesBySessionDate = new Map<string, MarketTrade[]>();
       for (const item of parsed.data) {
         const trade = normalizeTrade(item as HyperliquidTradeMessage);
         if (!trade) {
@@ -634,6 +1207,13 @@ export class MarketStateService {
         this.rollSessionIfNeeded(trade.timestamp);
         this.liveTrades.push(trade);
         this.lastTradeAt = trade.timestamp;
+        const sessionDate = formatSessionDate(trade.timestamp);
+        const existing = tradesBySessionDate.get(sessionDate) ?? [];
+        existing.push(trade);
+        tradesBySessionDate.set(sessionDate, existing);
+      }
+      for (const [sessionDate, trades] of tradesBySessionDate.entries()) {
+        this.store.appendArchivedTrades(sessionDate, trades);
       }
       await this.persistLiveSnapshot();
       return;
@@ -642,9 +1222,23 @@ export class MarketStateService {
     if (channel === 'activeAssetCtx') {
       const normalized = normalizeAssetContext(parsed.data);
       if (normalized) {
+        const timestamp = Date.now();
         this.currentAssetContext = normalized;
-        this.lastAssetContextAt = Date.now();
+        this.lastAssetContextAt = timestamp;
+        this.store.appendArchivedAssetContext(formatSessionDate(timestamp), [
+          toAssetContextPoint(normalized, timestamp),
+        ]);
         await this.persistLiveSnapshot();
+      }
+      return;
+    }
+
+    if (channel === 'l2Book') {
+      const normalized = normalizeOrderBook(parsed.data);
+      if (normalized) {
+        this.previousOrderBook = this.currentOrderBook;
+        this.currentOrderBook = normalized;
+        this.lastOrderBookAt = normalized.timestamp;
       }
     }
   }
@@ -661,16 +1255,27 @@ export class MarketStateService {
 
     const combinedTrades = [...this.bootstrapTrades, ...this.liveTrades];
     if (combinedTrades.length > 0) {
+      const sessionTrades = dedupeTrades(combinedTrades);
       const metrics = computeSessionMetrics({
-        trades: combinedTrades,
+        trades: sessionTrades,
         now: timestamp - 1,
         sessionStart: currentSessionStart,
       });
       const summary = buildSummaryFromMetrics({
         metrics,
-        source: this.liveTrades.length > 0 ? 'stream' : 'bootstrap',
+        source: inferSummarySource(sessionTrades),
         assetContext: this.currentAssetContext,
         freshness: this.getFreshness(),
+        dataQuality: computeDataQuality({
+          trades: sessionTrades,
+          sessionStart: currentSessionStart,
+          now: timestamp - 1,
+          freshness: this.getFreshness(),
+          lastOrderBookAt: this.lastOrderBookAt,
+          archiveUsed: sessionTrades.some((trade) => trade.source !== 'synthetic'),
+          hasArchiveHistory: sessionTrades.some((trade) => trade.source !== 'synthetic'),
+          includeLiveFreshnessFlags: false,
+        }),
       });
       this.store.saveCompletedSession(summary);
     }
@@ -681,7 +1286,16 @@ export class MarketStateService {
   }
 
   private async refreshSessionBootstrap(sessionStart: number): Promise<void> {
-    this.bootstrapTrades = await this.fetchCurrentSessionBootstrapTrades(sessionStart).catch(() => []);
+    const sessionDate = formatSessionDate(sessionStart);
+    const archivedTrades = this.store.loadArchivedTrades(sessionDate).map((trade) => ({
+      ...trade,
+      source: 'real' as const,
+    }));
+    const syntheticTrades = await this.fetchCurrentSessionBootstrapTrades(sessionStart).catch(() => []);
+    this.bootstrapTrades = mergeSessionTrades({
+      archivedTrades,
+      syntheticTrades,
+    });
     await this.persistLiveSnapshot();
   }
 
@@ -693,9 +1307,35 @@ export class MarketStateService {
     };
   }
 
+  private loadCurrentSessionAssetContextHistory(now: number): MarketAssetContextPoint[] {
+    const sessionDate = formatSessionDate(getUtcSessionStart(now));
+    const points = this.store.loadArchivedAssetContext(sessionDate);
+    const combined =
+      this.currentAssetContext && this.lastAssetContextAt !== null
+        ? [...points, toAssetContextPoint(this.currentAssetContext, this.lastAssetContextAt)]
+        : points;
+    const byKey = new Map<string, MarketAssetContextPoint>();
+
+    for (const point of combined) {
+      const key = [
+        point.timestamp,
+        point.markPx ?? '',
+        point.openInterest ?? '',
+        point.funding ?? '',
+        point.premium ?? '',
+      ].join(':');
+      byKey.set(key, point);
+    }
+
+    return [...byKey.values()].sort((left, right) => left.timestamp - right.timestamp);
+  }
+
   private async buildLiveSessionSnapshot(): Promise<PersistedSessionSummary> {
-    const sessionStart = getUtcSessionStart(Date.now());
-    const trades = [...this.bootstrapTrades, ...this.liveTrades];
+    const now = Date.now();
+    const sessionStart = getUtcSessionStart(now);
+    const sessionDate = formatSessionDate(sessionStart);
+    const trades = dedupeTrades([...this.bootstrapTrades, ...this.liveTrades]);
+    const archiveTradeCount = this.store.loadArchivedTrades(sessionDate).length;
 
     if (trades.length === 0) {
       const stored = this.store.loadLiveSession();
@@ -707,14 +1347,23 @@ export class MarketStateService {
 
     const metrics = computeSessionMetrics({
       trades,
-      now: Date.now(),
+      now,
       sessionStart,
     });
     return buildSummaryFromMetrics({
       metrics,
-      source: this.liveTrades.length > 0 ? 'stream' : 'bootstrap',
+      source: inferSummarySource(trades),
       assetContext: this.currentAssetContext,
       freshness: this.getFreshness(),
+      dataQuality: computeDataQuality({
+        trades,
+        sessionStart,
+        now,
+        freshness: this.getFreshness(),
+        lastOrderBookAt: this.lastOrderBookAt,
+        archiveUsed: archiveTradeCount > 0,
+        hasArchiveHistory: archiveTradeCount > 0,
+      }),
     });
   }
 
@@ -762,26 +1411,58 @@ export class MarketStateService {
         endTime,
       },
     });
+    const candleByDate = new Map(
+      candles.map((candle) => [formatSessionDate(candle.t), candle] as const),
+    );
+    const sessionStarts = Array.from({ length: 7 }, (_, index) => currentSessionStart - (7 - index) * 24 * 60 * 60 * 1000);
 
-    return candles.slice(-7).map((candle) => {
-      const candleStart = candle.t;
-      const candleEnd = candle.T;
-      const syntheticTrades = buildSyntheticTradesFromCandles([candle]);
+    return sessionStarts.flatMap((sessionStart) => {
+      const sessionDate = formatSessionDate(sessionStart);
+      const archivedTrades = this.store.loadArchivedTrades(sessionDate).map((trade) => ({
+        ...trade,
+        source: 'real' as const,
+      }));
+      const candle = candleByDate.get(sessionDate);
+      const syntheticTrades = candle ? buildSyntheticTradesFromCandles([candle]) : [];
+      const sessionTrades =
+        archivedTrades.length > 0
+          ? dedupeTrades(archivedTrades)
+          : dedupeTrades(syntheticTrades);
+
+      if (sessionTrades.length === 0) {
+        return [];
+      }
+
+      const sessionEnd = candle?.T ?? (sessionStart + 24 * 60 * 60 * 1000 - 1);
+      const freshness = {
+        lastTradeAt: sessionEnd,
+        lastAssetContextAt: null,
+        updatedAt: sessionEnd,
+      };
       const metrics = computeSessionMetrics({
-        trades: syntheticTrades,
-        now: candleEnd,
-        sessionStart: candleStart,
+        trades: sessionTrades,
+        now: sessionEnd,
+        sessionStart,
       });
-      return buildSummaryFromMetrics({
-        metrics,
-        source: 'bootstrap',
-        assetContext: null,
-        freshness: {
-          lastTradeAt: candleEnd,
-          lastAssetContextAt: null,
-          updatedAt: Date.now(),
-        },
-      });
+
+      return [
+        buildSummaryFromMetrics({
+          metrics,
+          source: archivedTrades.length > 0 ? 'archive' : 'bootstrap',
+          assetContext: null,
+          freshness,
+          dataQuality: computeDataQuality({
+            trades: sessionTrades,
+            sessionStart,
+            now: sessionEnd,
+            freshness,
+            lastOrderBookAt: null,
+            archiveUsed: archivedTrades.length > 0,
+            hasArchiveHistory: archivedTrades.length > 0,
+            includeLiveFreshnessFlags: false,
+          }),
+        }),
+      ];
     });
   }
 
@@ -804,5 +1485,14 @@ export class MarketStateService {
     }
 
     return normalizeAssetContext(assetContexts[btcIndex]);
+  }
+
+  private async fetchCurrentOrderBook(): Promise<OrderBookSnapshot | null> {
+    const response = await this.callInfoEndpoint<unknown>({
+      type: 'l2Book',
+      coin: BTC_COIN,
+    });
+
+    return normalizeOrderBook(response);
   }
 }

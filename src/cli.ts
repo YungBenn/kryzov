@@ -59,8 +59,29 @@ function summarizeToolResult(tool: string, args: Record<string, unknown>, result
         if (tool === 'market_context') {
           return 'Read live session context';
         }
+        if (tool === 'session_profile') {
+          return 'Computed session structure';
+        }
+        if (tool === 'positioning_regime') {
+          return 'Read positioning regime';
+        }
+        if (tool === 'volatility_pace') {
+          return 'Read volatility pace';
+        }
+        if (tool === 'session_analogs') {
+          return 'Compared recent session analogs';
+        }
         if (tool === 'recent_sessions') {
           return 'Loaded recent sessions';
+        }
+        if (tool === 'order_book_state') {
+          return 'Read order book state';
+        }
+        if (tool === 'flow_events') {
+          return 'Detected recent flow events';
+        }
+        if (tool === 'reference_map') {
+          return 'Ranked live references';
         }
         if (tool === 'level_response') {
           const label = typeof args.reference === 'string' ? args.reference : 'custom level';
